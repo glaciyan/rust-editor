@@ -1,0 +1,18 @@
+[package]
+name = "cutline-cli"
+description = "Command-line front end for Cutline's engine: probe, export, profiles."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cutline-cli"
+path = "src/main.rs"
+
+[dependencies]
+cutline-core.workspace = true
+cutline-ffmpeg.workspace = true
+cutline-engine.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

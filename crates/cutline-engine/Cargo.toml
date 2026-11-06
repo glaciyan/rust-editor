@@ -1,0 +1,16 @@
+[package]
+name = "cutline-engine"
+description = "Export planning (pure), the fit-to-size solver, estimates, the job queue, profile and session stores."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cutline-core.workspace = true
+cutline-ffmpeg.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+dirs.workspace = true
+xxhash-rust.workspace = true

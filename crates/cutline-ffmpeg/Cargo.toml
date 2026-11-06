@@ -1,0 +1,11 @@
+[package]
+name = "cutline-ffmpeg"
+description = "Find ffmpeg, probe media, build typed ffmpeg commands and run them with progress and cancel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

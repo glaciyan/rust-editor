@@ -1,0 +1,9 @@
+[package]
+name = "cutline-core"
+description = "Cutline data model: timestamps, parts, projects, profiles. No IO."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
