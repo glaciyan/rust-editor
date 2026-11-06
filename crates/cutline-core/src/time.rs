@@ -41,7 +41,12 @@ impl Timestamp {
     pub fn ffmpeg_arg(self) -> String {
         let neg = self.0 < 0;
         let a = self.0.unsigned_abs();
-        format!("{}{}.{:06}", if neg { "-" } else { "" }, a / 1_000_000, a % 1_000_000)
+        format!(
+            "{}{}.{:06}",
+            if neg { "-" } else { "" },
+            a / 1_000_000,
+            a % 1_000_000
+        )
     }
 }
 

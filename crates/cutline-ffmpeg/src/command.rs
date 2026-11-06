@@ -10,7 +10,10 @@ pub struct Input {
 
 impl Input {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Input { args: vec![], path: path.into() }
+        Input {
+            args: vec![],
+            path: path.into(),
+        }
     }
     pub fn arg(mut self, a: impl Into<String>) -> Self {
         self.args.push(a.into());
@@ -35,7 +38,10 @@ pub struct FfmpegCommand {
 
 impl FfmpegCommand {
     pub fn new(output: impl Into<PathBuf>) -> Self {
-        FfmpegCommand { output: output.into(), ..Default::default() }
+        FfmpegCommand {
+            output: output.into(),
+            ..Default::default()
+        }
     }
     pub fn input(mut self, i: Input) -> Self {
         self.inputs.push(i);
@@ -56,8 +62,16 @@ impl FfmpegCommand {
 
     /// Fixed leading options: quiet banner, never read stdin, overwrite our
     /// own temp files, machine-readable progress on stdout.
-    pub const PREAMBLE: [&'static str; 8] =
-        ["-hide_banner", "-nostdin", "-y", "-v", "warning", "-progress", "pipe:1", "-nostats"];
+    pub const PREAMBLE: [&'static str; 8] = [
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-v",
+        "warning",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+    ];
 
     pub fn argv(&self) -> Vec<OsString> {
         let mut v: Vec<OsString> = Self::PREAMBLE.iter().map(OsString::from).collect();
@@ -78,13 +92,20 @@ impl FfmpegCommand {
     /// A copy-pasteable shell line.
     pub fn display(&self, program: &str) -> String {
         let mut parts = vec![shell_quote(program)];
-        parts.extend(self.argv().iter().map(|a| shell_quote(&a.to_string_lossy())));
+        parts.extend(
+            self.argv()
+                .iter()
+                .map(|a| shell_quote(&a.to_string_lossy())),
+        );
         parts.join(" ")
     }
 }
 
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=+,%@".contains(c)) {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=+,%@".contains(c))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -100,6 +121,9 @@ mod tests {
             .input(Input::new("in file.mp4").args(["-ss", "1.000000"]))
             .args(["-c", "copy"]);
         let s = c.display("ffmpeg");
-        assert!(s.ends_with("-ss 1.000000 -i 'in file.mp4' -c copy out.mp4"), "{s}");
+        assert!(
+            s.ends_with("-ss 1.000000 -i 'in file.mp4' -c copy out.mp4"),
+            "{s}"
+        );
     }
 }

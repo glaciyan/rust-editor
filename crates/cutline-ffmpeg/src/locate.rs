@@ -57,7 +57,11 @@ impl Tools {
             .or_else(|| find("ffprobe"))
             .ok_or("Cutline needs ffprobe, which comes with ffmpeg.")?;
         let caps = Capabilities::detect(&ffmpeg);
-        Ok(Tools { ffmpeg, ffprobe, caps })
+        Ok(Tools {
+            ffmpeg,
+            ffprobe,
+            caps,
+        })
     }
 }
 
@@ -93,7 +97,10 @@ impl Capabilities {
 }
 
 fn parse_major(line: &str) -> Option<u32> {
-    let v = line.strip_prefix("ffmpeg version ")?.split_whitespace().next()?;
+    let v = line
+        .strip_prefix("ffmpeg version ")?
+        .split_whitespace()
+        .next()?;
     let v = v.trim_start_matches('n');
     let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
@@ -103,8 +110,17 @@ fn parse_major(line: &str) -> Option<u32> {
 mod tests {
     #[test]
     fn versions() {
-        assert_eq!(super::parse_major("ffmpeg version 6.1.1-3ubuntu5 Copyright"), Some(6));
-        assert_eq!(super::parse_major("ffmpeg version n7.0.2 Copyright"), Some(7));
-        assert_eq!(super::parse_major("ffmpeg version N-112233-gabc Copyright"), None);
+        assert_eq!(
+            super::parse_major("ffmpeg version 6.1.1-3ubuntu5 Copyright"),
+            Some(6)
+        );
+        assert_eq!(
+            super::parse_major("ffmpeg version n7.0.2 Copyright"),
+            Some(7)
+        );
+        assert_eq!(
+            super::parse_major("ffmpeg version N-112233-gabc Copyright"),
+            None
+        );
     }
 }

@@ -31,27 +31,48 @@ impl ExportRequest {
 
     /// Where the finished files go, in order.
     pub fn output_paths(&self, ext: &str) -> Vec<PathBuf> {
-        output_paths(&self.output_dir, &self.name, ext, self.separate, self.segments.len())
+        output_paths(
+            &self.output_dir,
+            &self.name,
+            ext,
+            self.separate,
+            self.segments.len(),
+        )
     }
 }
 
-pub fn output_paths(dir: &Path, name: &str, ext: &str, separate: bool, parts: usize) -> Vec<PathBuf> {
+pub fn output_paths(
+    dir: &Path,
+    name: &str,
+    ext: &str,
+    separate: bool,
+    parts: usize,
+) -> Vec<PathBuf> {
     if !separate || parts <= 1 {
         return vec![dir.join(format!("{name}.{ext}"))];
     }
     let base = name.strip_suffix(" (cut)").unwrap_or(name);
-    (1..=parts).map(|n| dir.join(format!("{base} (part {n}).{ext}"))).collect()
+    (1..=parts)
+        .map(|n| dir.join(format!("{base} (part {n}).{ext}")))
+        .collect()
 }
 
 /// The default name: `<stem> (cut)`.
 pub fn default_name(source: &Path) -> String {
-    let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video".into());
     format!("{stem} (cut)")
 }
 
 /// A name that doesn't clash with existing files: `x (cut)`, `x (cut 2)`, …
 pub fn free_name(dir: &Path, name: &str, ext: &str, separate: bool, parts: usize) -> String {
-    let taken = |n: &str| output_paths(dir, n, ext, separate, parts).iter().any(|p| p.exists());
+    let taken = |n: &str| {
+        output_paths(dir, n, ext, separate, parts)
+            .iter()
+            .any(|p| p.exists())
+    };
     if !taken(name) {
         return name.to_string();
     }
@@ -80,7 +101,10 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(default_name(Path::new("/v/holiday-clip.mp4")), "holiday-clip (cut)");
+        assert_eq!(
+            default_name(Path::new("/v/holiday-clip.mp4")),
+            "holiday-clip (cut)"
+        );
         let p = output_paths(Path::new("/v"), "a (cut)", "mp4", true, 2);
         assert_eq!(p[1], Path::new("/v/a (part 2).mp4"));
         let dir = std::env::temp_dir().join(format!("cutline-names-{}", std::process::id()));

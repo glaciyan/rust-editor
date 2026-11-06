@@ -6,7 +6,7 @@
 use crate::fit;
 use crate::plan::{CutStyle, ExportPlan, Facts, OutputPlan, PlanError, Planner, Step};
 use crate::request::ExportRequest;
-use cutline_ffmpeg::{probe, runner, FfmpegCommand, Input, RunError, Tools};
+use cutline_ffmpeg::{probe, runner, FfmpegCommand, RunError, Tools};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 pub type JobId = u64;
+
+/// Makes scratch folder names unique even if two jobs share an id.
+static SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What the Details view shows.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -87,7 +90,11 @@ impl Meter<'_> {
         let f = ((self.done + step_weight * frac) / total).clamp(0.0, 0.999);
         let elapsed = self.started.elapsed().as_secs_f64();
         let eta = (f > 0.03 && elapsed > 2.0).then(|| elapsed / f * (1.0 - f));
-        (self.on)(Progress { fraction: f, eta_secs: eta, stage: stage.to_string() });
+        (self.on)(Progress {
+            fraction: f,
+            eta_secs: eta,
+            stage: stage.to_string(),
+        });
     }
 }
 
@@ -100,7 +107,8 @@ impl<'a> Job<'a> {
         let mut sources = HashMap::new();
         for s in &self.req.segments {
             if !sources.contains_key(&s.path) {
-                let info = probe::probe(self.tools, &s.path).map_err(|e| JobError::Failed(e.to_string()))?;
+                let info = probe::probe(self.tools, &s.path)
+                    .map_err(|e| JobError::Failed(e.to_string()))?;
                 sources.insert(s.path.clone(), info);
             }
         }
@@ -109,7 +117,8 @@ impl<'a> Job<'a> {
             for s in &self.req.segments {
                 let info = &sources[&s.path];
                 // Read a little past the end so a keyframe-cut fallback finds the next keyframe.
-                let p = probe::packets(self.tools, info, s.start.secs(), s.end.secs() + 12.0).map_err(|e| JobError::Failed(e.to_string()))?;
+                let p = probe::packets(self.tools, info, s.start.secs(), s.end.secs() + 12.0)
+                    .map_err(|e| JobError::Failed(e.to_string()))?;
                 packets.push(p);
                 if self.canceled() {
                     return Err(JobError::Canceled);
@@ -119,46 +128,110 @@ impl<'a> Job<'a> {
         Ok(Facts { sources, packets })
     }
 
-    pub fn run(&self, on_progress: &mut dyn FnMut(Progress), details: &mut JobDetails) -> Result<Vec<JobOutput>, JobError> {
+    pub fn run(
+        &self,
+        on_progress: &mut dyn FnMut(Progress),
+        details: &mut JobDetails,
+    ) -> Result<Vec<JobOutput>, JobError> {
         let req = self.req;
-        on_progress(Progress { fraction: 0.0, eta_secs: None, stage: "Getting ready".into() });
+        on_progress(Progress {
+            fraction: 0.0,
+            eta_secs: None,
+            stage: "Getting ready".into(),
+        });
         let facts = self.facts()?;
-        std::fs::create_dir_all(&req.output_dir)
-            .map_err(|_| JobError::Failed("Cutline can't create that folder. Choose another one in Save to.".into()))?;
-        let tmp = req.output_dir.join(format!(".cutline-{}-{}", std::process::id(), self.id));
-        std::fs::create_dir_all(&tmp).map_err(|_| JobError::Failed("Cutline isn't allowed to save there. Choose another folder.".into()))?;
+        std::fs::create_dir_all(&req.output_dir).map_err(|_| {
+            JobError::Failed(
+                "Cutline can't create that folder. Choose another one in Save to.".into(),
+            )
+        })?;
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = req
+            .output_dir
+            .join(format!(".cutline-{}-{}-{seq}", std::process::id(), self.id));
+        std::fs::create_dir_all(&tmp).map_err(|_| {
+            JobError::Failed("Cutline isn't allowed to save there. Choose another folder.".into())
+        })?;
         let _scratch = Scratch(tmp.clone());
-        let pass_dir = std::env::temp_dir().join(format!("cutline-pass-{}-{}", std::process::id(), self.id));
+        let pass_dir = std::env::temp_dir().join(format!(
+            "cutline-pass-{}-{}-{seq}",
+            std::process::id(),
+            self.id
+        ));
         std::fs::create_dir_all(&pass_dir).map_err(|e| JobError::Failed(e.to_string()))?;
         let _pass_scratch = Scratch(pass_dir.clone());
-        let planner = Planner { req, facts: &facts, caps: &self.tools.caps, tmp: &tmp, pass_log_dir: &pass_dir };
+        let planner = Planner {
+            req,
+            facts: &facts,
+            caps: &self.tools.caps,
+            tmp: &tmp,
+            pass_log_dir: &pass_dir,
+        };
         let plan: ExportPlan = planner.plan()?;
         details.notes.extend(plan.notes.iter().cloned());
 
         // Refuse to overwrite anything the user didn't agree to replace.
         if !req.overwrite {
             if let Some(p) = plan.outputs.iter().find(|o| o.final_path.exists()) {
-                return Err(JobError::Failed(format!("{} already exists.", p.final_path.file_name().unwrap_or_default().to_string_lossy())));
+                return Err(JobError::Failed(format!(
+                    "{} already exists.",
+                    p.final_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )));
             }
         }
 
-        let total: f64 = plan.outputs.iter().flat_map(|o| o.steps.iter()).map(step_weight).sum();
-        let mut meter = Meter { total, done: 0.0, started: Instant::now(), on: on_progress };
+        let total: f64 = plan
+            .outputs
+            .iter()
+            .flat_map(|o| o.steps.iter())
+            .map(step_weight)
+            .sum();
+        let mut meter = Meter {
+            total,
+            done: 0.0,
+            started: Instant::now(),
+            on: on_progress,
+        };
         let mut finished = vec![];
         for (oi, out) in plan.outputs.iter().enumerate() {
-            let stage = if plan.outputs.len() > 1 { format!("Saving part {} of {}", oi + 1, plan.outputs.len()) } else { "Saving".into() };
+            let stage = if plan.outputs.len() > 1 {
+                format!("Saving part {} of {}", oi + 1, plan.outputs.len())
+            } else {
+                "Saving".into()
+            };
             let ok = self.run_steps(&out.steps, &mut meter, &stage, details)?;
             if !ok && out.smart {
-                // A junction didn't decode cleanly: redo this output with keyframe cuts.
-                details.log.push_str("\n== Smart cut check failed; falling back to keyframe cuts ==\n");
-                let fallback = planner.plan_with(CutStyle::Keyframe, None)?;
+                // A junction didn't decode cleanly. Keep the user's exact cut
+                // points and convert this video at matching quality instead.
+                details
+                    .log
+                    .push_str("\n== Smart cut check failed; converting this video instead ==\n");
+                details.notes.push("A cut didn't join cleanly, so this video was converted at matching quality instead.".into());
+                let mut converted = req.clone();
+                converted.profile = planner.original_as_encode();
+                let p2 = Planner {
+                    req: &converted,
+                    facts: &facts,
+                    caps: &self.tools.caps,
+                    tmp: &tmp,
+                    pass_log_dir: &pass_dir,
+                };
+                let fallback = p2.plan()?;
                 let fb = &fallback.outputs[oi];
-                details.notes.extend(fallback.notes.iter().cloned());
+                meter.total += fb.steps.iter().map(step_weight).sum::<f64>();
                 if !self.run_steps(&fb.steps, &mut meter, &stage, details)? {
-                    return Err(JobError::Failed("The saved video didn't play back cleanly. Details has the full log.".into()));
+                    return Err(JobError::Failed(
+                        "The saved video didn't play back cleanly. Details has the full log."
+                            .into(),
+                    ));
                 }
             } else if !ok {
-                return Err(JobError::Failed("The saved video didn't play back cleanly. Details has the full log.".into()));
+                return Err(JobError::Failed(
+                    "The saved video didn't play back cleanly. Details has the full log.".into(),
+                ));
             }
             if out.fit.is_some() {
                 self.enforce_size(&planner, oi, out, &mut meter, &stage, details)?;
@@ -170,17 +243,32 @@ impl<'a> Job<'a> {
         let mut outputs = vec![];
         for out in finished {
             if !req.overwrite && out.final_path.exists() {
-                return Err(JobError::Failed(format!("{} already exists.", out.final_path.display())));
+                return Err(JobError::Failed(format!(
+                    "{} already exists.",
+                    out.final_path.display()
+                )));
             }
-            std::fs::rename(&out.temp_path, &out.final_path).map_err(|e| JobError::Failed(format!("Couldn't save the file: {e}")))?;
-            let bytes = std::fs::metadata(&out.final_path).map(|m| m.len()).unwrap_or(0);
-            outputs.push(JobOutput { path: out.final_path.clone(), bytes });
+            std::fs::rename(&out.temp_path, &out.final_path)
+                .map_err(|e| JobError::Failed(format!("Couldn't save the file: {e}")))?;
+            let bytes = std::fs::metadata(&out.final_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            outputs.push(JobOutput {
+                path: out.final_path.clone(),
+                bytes,
+            });
         }
         Ok(outputs)
     }
 
     /// Returns false if a Verify step found broken frames.
-    fn run_steps(&self, steps: &[Step], meter: &mut Meter, stage: &str, details: &mut JobDetails) -> Result<bool, JobError> {
+    fn run_steps(
+        &self,
+        steps: &[Step],
+        meter: &mut Meter,
+        stage: &str,
+        details: &mut JobDetails,
+    ) -> Result<bool, JobError> {
         for step in steps {
             if self.canceled() {
                 return Err(JobError::Canceled);
@@ -188,9 +276,17 @@ impl<'a> Job<'a> {
             match step {
                 Step::Write { path, contents } => {
                     std::fs::write(path, contents).map_err(|e| JobError::Failed(e.to_string()))?;
-                    details.log.push_str(&format!("\n== wrote {} ==\n{contents}", path.display()));
+                    details
+                        .log
+                        .push_str(&format!("\n== wrote {} ==\n{contents}", path.display()));
                 }
-                Step::Run { label, cmd, out_duration, weight, .. } => {
+                Step::Run {
+                    label,
+                    cmd,
+                    out_duration,
+                    weight,
+                    ..
+                } => {
                     self.run_cmd(cmd, *out_duration, *weight, meter, stage, label, details)?;
                     meter.done += weight;
                 }
@@ -217,10 +313,14 @@ impl<'a> Job<'a> {
         label: &str,
         details: &mut JobDetails,
     ) -> Result<(), JobError> {
-        details.commands.push(cmd.display(&self.tools.ffmpeg.to_string_lossy()));
+        details
+            .commands
+            .push(cmd.display(&self.tools.ffmpeg.to_string_lossy()));
         details.log.push_str(&format!("\n== {label} ==\n"));
         meter.report(weight, 0.0, stage);
-        let res = runner::run(self.tools, cmd, out_duration, self.cancel, &mut |f| meter.report(weight, f, stage));
+        let res = runner::run(self.tools, cmd, out_duration, self.cancel, &mut |f| {
+            meter.report(weight, f, stage)
+        });
         match res {
             Ok(log) => {
                 details.log.push_str(&log.stderr);
@@ -229,38 +329,55 @@ impl<'a> Job<'a> {
             Err(RunError::Canceled) => Err(JobError::Canceled),
             Err(RunError::Failed { log, code }) => {
                 details.log.push_str(&log.stderr);
-                details.log.push_str(&format!("\n(ffmpeg exited with {})\n", code.map(|c| c.to_string()).unwrap_or("a signal".into())));
+                details.log.push_str(&format!(
+                    "\n(ffmpeg exited with {})\n",
+                    code.map(|c| c.to_string()).unwrap_or("a signal".into())
+                ));
                 Err(JobError::Failed(explain(&log.stderr)))
             }
             Err(RunError::Spawn(e)) => Err(JobError::Failed(format!("Couldn't start ffmpeg: {e}"))),
         }
     }
 
-    /// Decode around each junction; any decoder error means a bad splice.
-    fn verify(&self, path: &Path, around: &[f64], details: &mut JobDetails) -> Result<bool, JobError> {
+    /// Decode around each junction. A good splice decodes without errors and
+    /// yields frames whose timestamps strictly increase with no gaps; a bad
+    /// one (wrong parameter sets, picture-order confusion) shows up as decode
+    /// errors or frames coming out of order.
+    fn verify(
+        &self,
+        path: &Path,
+        around: &[f64],
+        details: &mut JobDetails,
+    ) -> Result<bool, JobError> {
         for &t in around {
-            let cmd = FfmpegCommand::new("-")
-                .input(Input::new(path).args(["-ss".to_string(), format!("{:.6}", (t - 1.0).max(0.0)), "-t".into(), "2.0".into()]))
-                .args(["-map", "0:v:0", "-f", "null"]);
-            details.commands.push(cmd.display(&self.tools.ffmpeg.to_string_lossy()));
-            let cmd = FfmpegCommand { output_args: [vec!["-xerror".to_string()], cmd.output_args.clone()].concat(), ..cmd };
-            match runner::run(self.tools, &cmd, 2.0, self.cancel, &mut |_| {}) {
-                Ok(log) => {
-                    let bad = log.stderr.lines().any(|l| {
-                        let l = l.to_ascii_lowercase();
-                        l.contains("error") || l.contains("corrupt") || l.contains("missing reference") || l.contains("could not find ref")
-                    });
-                    if bad {
-                        details.log.push_str(&format!("\n== check at {t:.3}s found problems ==\n{}", log.stderr));
-                        return Ok(false);
-                    }
-                }
-                Err(RunError::Canceled) => return Err(JobError::Canceled),
-                Err(RunError::Failed { log, .. }) => {
-                    details.log.push_str(&format!("\n== check at {t:.3}s failed ==\n{}", log.stderr));
-                    return Ok(false);
-                }
-                Err(RunError::Spawn(e)) => return Err(JobError::Failed(e.to_string())),
+            if self.canceled() {
+                return Err(JobError::Canceled);
+            }
+            let (a, b) = ((t - 1.0).max(0.0), t + 1.0);
+            let out = std::process::Command::new(&self.tools.ffprobe)
+                .args(["-v", "error", "-select_streams", "v:0", "-read_intervals"])
+                .arg(format!("{a:.6}%{b:.6}"))
+                .args(["-show_entries", "frame=pts_time", "-of", "csv=p=0"])
+                .arg(path)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| JobError::Failed(e.to_string()))?;
+            details.commands.push(format!(
+                "{} -v error -select_streams v:0 -read_intervals {a:.6}%{b:.6} -show_entries frame=pts_time -of csv=p=0 {}",
+                self.tools.ffprobe.display(),
+                cutline_ffmpeg::command::shell_quote(&path.to_string_lossy())
+            ));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let pts: Vec<f64> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.trim().trim_end_matches(',').parse().ok())
+                .collect();
+            let problem = splice_problem(&pts, &stderr);
+            if let Some(why) = problem {
+                details
+                    .log
+                    .push_str(&format!("\n== check at {t:.3}s: {why} ==\n{stderr}"));
+                return Ok(false);
             }
         }
         Ok(true)
@@ -268,11 +385,21 @@ impl<'a> Job<'a> {
 
     /// Fit to size: if the encode came out over the target, run the second
     /// pass again at a corrected bitrate (at most twice).
-    fn enforce_size(&self, planner: &Planner, oi: usize, out: &OutputPlan, meter: &mut Meter, stage: &str, details: &mut JobDetails) -> Result<(), JobError> {
+    fn enforce_size(
+        &self,
+        planner: &Planner,
+        oi: usize,
+        out: &OutputPlan,
+        meter: &mut Meter,
+        stage: &str,
+        details: &mut JobDetails,
+    ) -> Result<(), JobError> {
         let fit = out.fit.as_ref().expect("fit plan");
         let mut kbps = fit.settings.video_kbps;
         for attempt in 1..=2 {
-            let actual = std::fs::metadata(&out.temp_path).map(|m| m.len() as f64).unwrap_or(0.0);
+            let actual = std::fs::metadata(&out.temp_path)
+                .map(|m| m.len() as f64)
+                .unwrap_or(0.0);
             details.log.push_str(&format!(
                 "\n== size check: {:.2} MB for a {:.2} MB target at {kbps} kbit/s ==\n",
                 actual / 1e6,
@@ -281,15 +408,39 @@ impl<'a> Job<'a> {
             if actual <= fit.target_bytes {
                 return Ok(());
             }
-            kbps = fit::corrected_video_kbps(kbps, actual, fit.target_bytes, fit.audio_bytes, fit.overhead);
-            details.notes.push(format!("The first try came out a little big, so attempt {} used a lower bitrate.", attempt + 1));
+            kbps = fit::corrected_video_kbps(
+                kbps,
+                actual,
+                fit.target_bytes,
+                fit.audio_bytes,
+                fit.overhead,
+            );
+            details.notes.push(format!(
+                "The first try came out a little big, so attempt {} used a lower bitrate.",
+                attempt + 1
+            ));
             let replan = planner.plan_with(CutStyle::Smart, Some(kbps))?;
-            let steps: Vec<Step> = replan.outputs[oi].steps.iter().filter(|s| matches!(s, Step::Run { second_pass: true, .. })).cloned().collect();
+            let steps: Vec<Step> = replan.outputs[oi]
+                .steps
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s,
+                        Step::Run {
+                            second_pass: true,
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .collect();
             let extra: f64 = steps.iter().map(step_weight).sum();
             meter.total += extra;
             self.run_steps(&steps, meter, stage, details)?;
         }
-        let actual = std::fs::metadata(&out.temp_path).map(|m| m.len() as f64).unwrap_or(0.0);
+        let actual = std::fs::metadata(&out.temp_path)
+            .map(|m| m.len() as f64)
+            .unwrap_or(0.0);
         if actual > fit.target_bytes {
             return Err(JobError::Failed(format!(
                 "Couldn't get the video under {:.0} MB. Try a slightly bigger size.",
@@ -300,10 +451,73 @@ impl<'a> Job<'a> {
     }
 }
 
+/// What's wrong with the frames decoded around a junction, if anything.
+pub fn splice_problem(pts: &[f64], stderr: &str) -> Option<String> {
+    // Warnings that also appear when decoding starts on an open-GOP keyframe are fine.
+    let bad = stderr.lines().find(|l| {
+        let l = l.to_ascii_lowercase();
+        [
+            "error while decoding",
+            "corrupt",
+            "non-existing",
+            "decode_slice_header",
+            "concealing",
+            "missing reference",
+            "could not find ref",
+            "invalid data",
+        ]
+        .iter()
+        .any(|k| l.contains(k))
+    });
+    if let Some(l) = bad {
+        return Some(format!("decoder error: {}", l.trim()));
+    }
+    if pts.len() < 2 {
+        return Some("no frames decoded".into());
+    }
+    let mut diffs: Vec<f64> = pts.windows(2).map(|w| w[1] - w[0]).collect();
+    if let Some(d) = diffs.iter().find(|d| **d <= 0.0) {
+        return Some(format!("frames out of order (step {d:.4}s)"));
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let frame = diffs[diffs.len() / 2];
+    if let Some(gap) = pts
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .find(|d| *d > frame * 1.6)
+    {
+        return Some(format!("gap of {gap:.4}s between frames"));
+    }
+    None
+}
+
 pub fn step_weight(s: &Step) -> f64 {
     match s {
         Step::Run { weight, .. } => *weight,
         Step::Verify { around, .. } => around.len() as f64 * 0.05,
         Step::Write { .. } => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splice_problem;
+
+    #[test]
+    fn splice_checks() {
+        let good: Vec<f64> = (0..60).map(|i| i as f64 / 30.0).collect();
+        assert_eq!(
+            splice_problem(&good, "[h264] mmco: unref short failure"),
+            None
+        );
+        let mut swapped = good.clone();
+        swapped.swap(20, 21);
+        assert!(splice_problem(&swapped, "")
+            .unwrap()
+            .contains("out of order"));
+        let mut gap = good.clone();
+        gap.remove(30);
+        assert!(splice_problem(&gap, "").unwrap().contains("gap"));
+        assert!(splice_problem(&good, "[h264] error while decoding MB 0 0").is_some());
     }
 }

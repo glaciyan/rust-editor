@@ -48,7 +48,13 @@ pub fn load_session() -> Option<Session> {
     let bytes = std::fs::read(session_path()).ok()?;
     let mut s: Session = serde_json::from_slice(&bytes).ok()?;
     // Drop videos that have gone away since.
-    let gone: Vec<u64> = s.project.clips.iter().filter(|c| !c.path.exists()).map(|c| c.id).collect();
+    let gone: Vec<u64> = s
+        .project
+        .clips
+        .iter()
+        .filter(|c| !c.path.exists())
+        .map(|c| c.id)
+        .collect();
     for id in gone {
         s.project.remove_clip(id);
     }
@@ -57,7 +63,10 @@ pub fn load_session() -> Option<Session> {
 }
 
 pub fn save_session(s: &Session) -> std::io::Result<()> {
-    write_atomic(&session_path(), &serde_json::to_vec_pretty(s).unwrap_or_default())
+    write_atomic(
+        &session_path(),
+        &serde_json::to_vec_pretty(s).unwrap_or_default(),
+    )
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -71,10 +80,16 @@ impl ProfileStore {
         config_dir().join("profiles.json")
     }
     pub fn load() -> ProfileStore {
-        std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        std::fs::read(Self::path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
     }
     pub fn save(&self) -> std::io::Result<()> {
-        write_atomic(&Self::path(), &serde_json::to_vec_pretty(self).unwrap_or_default())
+        write_atomic(
+            &Self::path(),
+            &serde_json::to_vec_pretty(self).unwrap_or_default(),
+        )
     }
     /// Built-in presets followed by the user's own.
     pub fn presets(&self) -> Vec<Profile> {
@@ -92,6 +107,9 @@ impl ProfileStore {
         self.user.retain(|p| p.id != id);
     }
     pub fn new_id(&self) -> String {
-        (1..).map(|i| format!("user-{i}")).find(|id| !self.user.iter().any(|p| &p.id == id)).unwrap()
+        (1..)
+            .map(|i| format!("user-{i}"))
+            .find(|id| !self.user.iter().any(|p| &p.id == id))
+            .unwrap()
     }
 }

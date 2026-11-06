@@ -72,10 +72,14 @@ pub struct FitSettings {
 #[derive(Clone, Debug, PartialEq)]
 pub enum FitOutcome {
     /// The target is at least what Original quality makes; no need to re-encode.
-    Original { bytes: f64 },
+    Original {
+        bytes: f64,
+    },
     Encode(FitSettings),
     /// Not even the smallest picture fits. `min_bytes` is the smallest target that would.
-    TooSmall { min_bytes: f64 },
+    TooSmall {
+        min_bytes: f64,
+    },
 }
 
 /// Bytes the MP4 container adds on top of the streams.
@@ -113,13 +117,21 @@ pub fn audio_kbps(total_kbps: f64, channels: &[u32], src_kbps: &[Option<u32>]) -
     let share = if total_kbps < 600.0 { 0.25 } else { 0.15 };
     let allowed = total_kbps * share / n;
     let mono = channels.iter().all(|c| *c <= 1);
-    let mut a = AUDIO_LADDER.iter().copied().find(|a| (*a as f64) <= allowed).unwrap_or(32);
+    let mut a = AUDIO_LADDER
+        .iter()
+        .copied()
+        .find(|a| (*a as f64) <= allowed)
+        .unwrap_or(32);
     if mono {
         a = a.min(96);
     }
     // Never spend more than the source had (it can't sound better).
     if let Some(src_max) = src_kbps.iter().flatten().max() {
-        let cap = AUDIO_LADDER.iter().copied().find(|l| *l <= (*src_max).max(32)).unwrap_or(32);
+        let cap = AUDIO_LADDER
+            .iter()
+            .copied()
+            .find(|l| *l <= (*src_max).max(32))
+            .unwrap_or(32);
         a = a.min(cap);
     }
     a
@@ -153,11 +165,20 @@ fn size_cap(height: u32, src_height: u32) -> Quality {
 pub fn solve(input: &FitInput) -> FitOutcome {
     let dur = input.duration.max(0.1);
     let has_video = input.src_height > 0 && input.src_width > 0;
-    let fps = if input.src_fps > 0.0 { input.src_fps } else { 30.0 };
+    let fps = if input.src_fps > 0.0 {
+        input.src_fps
+    } else {
+        30.0
+    };
     let n_audio = input.audio_channels.len();
 
-    if input.original_possible && input.original_bytes > 0.0 && input.target_bytes >= input.original_bytes {
-        return FitOutcome::Original { bytes: input.original_bytes };
+    if input.original_possible
+        && input.original_bytes > 0.0
+        && input.target_bytes >= input.original_bytes
+    {
+        return FitOutcome::Original {
+            bytes: input.original_bytes,
+        };
     }
 
     let min_bytes = minimum_bytes(input);
@@ -176,14 +197,26 @@ pub fn solve(input: &FitInput) -> FitOutcome {
         if per < 24.0 {
             return FitOutcome::TooSmall { min_bytes };
         }
-        let per = AUDIO_LADDER.iter().copied().find(|l| (*l as f64) <= per).unwrap_or(32);
+        let per = AUDIO_LADDER
+            .iter()
+            .copied()
+            .find(|l| (*l as f64) <= per)
+            .unwrap_or(32);
         return FitOutcome::Encode(FitSettings {
             video_kbps: 0,
             audio_kbps: per,
             height: None,
             width: 0,
             fps: None,
-            quality: if per >= 128 { Quality::Great } else if per >= 96 { Quality::Good } else if per >= 64 { Quality::Okay } else { Quality::Low },
+            quality: if per >= 128 {
+                Quality::Great
+            } else if per >= 96 {
+                Quality::Good
+            } else if per >= 64 {
+                Quality::Okay
+            } else {
+                Quality::Low
+            },
             expected_bytes: input.target_bytes * (1.0 - MARGIN),
         });
     }
@@ -196,7 +229,9 @@ pub fn solve(input: &FitInput) -> FitOutcome {
     if let Some(src) = input.src_video_bps.filter(|b| *b > 0.0) {
         if video_kbps * 1000.0 >= src * 1.05 {
             if input.original_possible {
-                return FitOutcome::Original { bytes: input.original_bytes };
+                return FitOutcome::Original {
+                    bytes: input.original_bytes,
+                };
             }
             video_kbps = src * 1.05 / 1000.0;
             capped_by_source = true;
@@ -248,7 +283,8 @@ pub fn solve(input: &FitInput) -> FitOutcome {
         width: w,
         fps: r,
         quality,
-        expected_bytes: ((video_kbps.floor() + (a as f64) * n_audio as f64) * 1000.0 / 8.0) * dur + overhead,
+        expected_bytes: ((video_kbps.floor() + (a as f64) * n_audio as f64) * 1000.0 / 8.0) * dur
+            + overhead,
     })
 }
 
@@ -259,22 +295,39 @@ pub fn minimum_bytes(input: &FitInput) -> f64 {
     let has_video = input.src_height > 0;
     let (video_bps, fps) = if has_video {
         let sh = input.src_height;
-        let h = HEIGHTS.iter().copied().filter(|h| *h < sh).last().unwrap_or(sh);
+        let h = HEIGHTS.iter().copied().rfind(|h| *h < sh).unwrap_or(sh);
         let w = even(h as f64 * input.src_width as f64 / sh as f64);
-        let fps = if input.src_fps > 31.0 { input.src_fps / 2.0 } else { input.src_fps.max(1.0) };
-        ((good_bitrate(input.codec, w, h, fps) * MIN_RATIO).max(40_000.0), fps)
+        let fps = if input.src_fps > 31.0 {
+            input.src_fps / 2.0
+        } else {
+            input.src_fps.max(1.0)
+        };
+        (
+            (good_bitrate(input.codec, w, h, fps) * MIN_RATIO).max(40_000.0),
+            fps,
+        )
     } else {
         (0.0, 0.0)
     };
     let audio_bps = 32_000.0 * n_audio;
     let raw = (video_bps + audio_bps) / 8.0 * dur + container_overhead(dur, fps, n_audio as usize);
     // The audio share rule means audio at the minimum is ~25% of total: solve with that in mind.
-    let with_share = if n_audio > 0.0 && has_video { raw.max((audio_bps / 0.25) / 8.0 * dur) } else { raw };
+    let with_share = if n_audio > 0.0 && has_video {
+        raw.max((audio_bps / 0.25) / 8.0 * dur)
+    } else {
+        raw
+    };
     ((with_share / (1.0 - MARGIN)) / 1e6).ceil() * 1e6
 }
 
 /// Video kbit/s for a retry after a first attempt came out `actual_bytes`.
-pub fn corrected_video_kbps(previous_kbps: u32, actual_bytes: f64, target_bytes: f64, audio_bytes: f64, overhead: f64) -> u32 {
+pub fn corrected_video_kbps(
+    previous_kbps: u32,
+    actual_bytes: f64,
+    target_bytes: f64,
+    audio_bytes: f64,
+    overhead: f64,
+) -> u32 {
     let video_actual = (actual_bytes - audio_bytes - overhead).max(1.0);
     let video_room = (target_bytes * (1.0 - MARGIN) - audio_bytes - overhead).max(1.0);
     let k = (video_room / video_actual) * 0.98;
@@ -302,19 +355,33 @@ mod tests {
     }
 
     fn total_bytes(s: &FitSettings, dur: f64, fps: f64, tracks: usize) -> f64 {
-        (s.video_kbps as f64 + s.audio_kbps as f64 * tracks as f64) * 1000.0 / 8.0 * dur + container_overhead(dur, fps, tracks)
+        (s.video_kbps as f64 + s.audio_kbps as f64 * tracks as f64) * 1000.0 / 8.0 * dur
+            + container_overhead(dur, fps, tracks)
     }
 
     #[test]
     fn budget_never_exceeds_target() {
-        for &(mb, dur) in &[(8.0, 30.0), (10.0, 120.0), (25.0, 60.0), (50.0, 600.0), (8.0, 8.0), (100.0, 3600.0)] {
+        for &(mb, dur) in &[
+            (8.0, 30.0),
+            (10.0, 120.0),
+            (25.0, 60.0),
+            (50.0, 600.0),
+            (8.0, 8.0),
+            (100.0, 3600.0),
+        ] {
             let i = input(mb, dur, 1920, 1080, 30.0);
             match solve(&i) {
                 FitOutcome::Encode(s) => {
                     let fps = s.fps.unwrap_or(30.0);
                     let b = total_bytes(&s, dur, fps, 1);
-                    assert!(b <= mb * 1e6 * (1.0 - MARGIN) + 1.0, "{mb} MB / {dur}s planned {b}");
-                    assert!(b >= mb * 1e6 * 0.9, "wastes budget: {mb} MB / {dur}s planned {b}");
+                    assert!(
+                        b <= mb * 1e6 * (1.0 - MARGIN) + 1.0,
+                        "{mb} MB / {dur}s planned {b}"
+                    );
+                    assert!(
+                        b >= mb * 1e6 * 0.9,
+                        "wastes budget: {mb} MB / {dur}s planned {b}"
+                    );
                 }
                 FitOutcome::TooSmall { min_bytes } => assert!(min_bytes > mb * 1e6, "{mb} {dur}"),
                 FitOutcome::Original { .. } => panic!("unexpected original"),
@@ -325,26 +392,36 @@ mod tests {
     #[test]
     fn scales_down_when_tight() {
         // 10 MB for two minutes of 1080p: ~600 kbps, should drop below 1080.
-        let FitOutcome::Encode(s) = solve(&input(10.0, 120.0, 1920, 1080, 30.0)) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&input(10.0, 120.0, 1920, 1080, 30.0)) else {
+            panic!()
+        };
         assert!(s.height.unwrap() < 1080);
         assert_eq!(s.width % 2, 0);
         // 50 MB for 30 s: plenty, keep full size, great.
-        let FitOutcome::Encode(s) = solve(&input(50.0, 30.0, 1920, 1080, 30.0)) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&input(50.0, 30.0, 1920, 1080, 30.0)) else {
+            panic!()
+        };
         assert_eq!(s.height, None);
         assert_eq!(s.quality, Quality::Great);
     }
 
     #[test]
     fn high_frame_rate_halves_before_shrinking() {
-        let FitOutcome::Encode(s) = solve(&input(20.0, 60.0, 1920, 1080, 60.0)) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&input(20.0, 60.0, 1920, 1080, 60.0)) else {
+            panic!()
+        };
         // ~2.5 Mbps: 1080p60 needs ~2.1 Mbps → should stay 1080p60.
         assert_eq!((s.height, s.fps), (None, None));
         // ~1.4 Mbps: 1080p60 would look poor; something smaller must be chosen.
-        let FitOutcome::Encode(s) = solve(&input(12.0, 60.0, 1920, 1080, 60.0)) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&input(12.0, 60.0, 1920, 1080, 60.0)) else {
+            panic!()
+        };
         assert!(s.height.is_some() || s.fps.is_some());
         assert!(s.quality >= Quality::Good);
         // 1080p60 at ~1.9 Mbps: half rate at full size is enough.
-        let FitOutcome::Encode(s) = solve(&input(16.0, 60.0, 1920, 1080, 60.0)) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&input(16.0, 60.0, 1920, 1080, 60.0)) else {
+            panic!()
+        };
         assert_eq!((s.height, s.fps), (None, Some(30.0)));
     }
 
@@ -354,7 +431,9 @@ mod tests {
         i.original_bytes = 25e6;
         assert!(matches!(solve(&i), FitOutcome::Original { .. }));
         i.original_possible = false;
-        let FitOutcome::Encode(s) = solve(&i) else { panic!() };
+        let FitOutcome::Encode(s) = solve(&i) else {
+            panic!()
+        };
         assert!(s.video_kbps <= 21_000);
         assert_eq!(s.quality, Quality::Great);
     }
@@ -362,10 +441,15 @@ mod tests {
     #[test]
     fn too_small_reports_a_working_minimum() {
         let i = input(1.0, 3600.0, 1920, 1080, 30.0);
-        let FitOutcome::TooSmall { min_bytes } = solve(&i) else { panic!() };
+        let FitOutcome::TooSmall { min_bytes } = solve(&i) else {
+            panic!()
+        };
         let mut j = i.clone();
         j.target_bytes = min_bytes;
-        assert!(matches!(solve(&j), FitOutcome::Encode(_)), "minimum {min_bytes} doesn't solve");
+        assert!(
+            matches!(solve(&j), FitOutcome::Encode(_)),
+            "minimum {min_bytes} doesn't solve"
+        );
         assert_eq!(min_bytes % 1e6, 0.0);
     }
 
@@ -399,7 +483,13 @@ mod tests {
     fn audio_only() {
         let mut i = input(5.0, 300.0, 0, 0, 0.0);
         i.original_possible = false;
-        let FitOutcome::Encode(s) = solve(&i) else { panic!() };
-        assert!(s.audio_kbps >= 96 && s.audio_kbps <= 160, "{}", s.audio_kbps);
+        let FitOutcome::Encode(s) = solve(&i) else {
+            panic!()
+        };
+        assert!(
+            s.audio_kbps >= 96 && s.audio_kbps <= 160,
+            "{}",
+            s.audio_kbps
+        );
     }
 }

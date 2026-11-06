@@ -4,8 +4,8 @@ members = [
     "crates/cutline-core",
     "crates/cutline-ffmpeg",
     "crates/cutline-engine",
-    #"crates/cutline-preview",
-    #"crates/cutline-gui",
+    "crates/cutline-preview",
+    "crates/cutline-gui",
     "crates/cutline-cli",
 ]
 

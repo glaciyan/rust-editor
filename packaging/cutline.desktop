@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Cutline
+GenericName=Video Cutter
+Comment=Cut parts out of videos without losing quality
+Exec=cutline %F
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;
+MimeType=video/mp4;video/quicktime;video/x-matroska;video/webm;video/mp2t;video/x-m4v;
+Keywords=cut;trim;video;hevc;h265;
+StartupWMClass=cutline

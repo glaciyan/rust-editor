@@ -11,7 +11,11 @@ use cutline_ffmpeg::{probe, Tools};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "cutline-cli", version, about = "Cut videos without the window.")]
+#[command(
+    name = "cutline-cli",
+    version,
+    about = "Cut videos without the window."
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -62,7 +66,10 @@ enum Cmd {
 fn parse_time(s: &str) -> Result<f64> {
     let mut total = 0.0;
     for part in s.trim().split(':') {
-        total = total * 60.0 + part.parse::<f64>().with_context(|| format!("bad time {s:?}"))?;
+        total = total * 60.0
+            + part
+                .parse::<f64>()
+                .with_context(|| format!("bad time {s:?}"))?;
     }
     Ok(total)
 }
@@ -76,24 +83,47 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&info)?);
         }
         Cmd::Profiles => {
-            println!("original  Original quality — {}", Profile::original().description);
+            println!(
+                "original  Original quality — {}",
+                Profile::original().description
+            );
             println!("fit       Fit to size (use --size MB)");
             for p in ProfileStore::load().presets() {
                 println!("{:<9} {} — {}", p.id, p.name, p.description);
             }
         }
-        Cmd::Export { files, keep, profile, size, out, name, separate, overwrite, audio, plan } => {
+        Cmd::Export {
+            files,
+            keep,
+            profile,
+            size,
+            out,
+            name,
+            separate,
+            overwrite,
+            audio,
+            plan,
+        } => {
             let mut sources = std::collections::HashMap::new();
             for f in &files {
-                let f = std::fs::canonicalize(f).with_context(|| format!("can't find {}", f.display()))?;
+                let f = std::fs::canonicalize(f)
+                    .with_context(|| format!("can't find {}", f.display()))?;
                 sources.insert(f.clone(), probe::probe(&tools, &f)?);
             }
-            let canon: Vec<PathBuf> = files.iter().map(|f| std::fs::canonicalize(f).unwrap()).collect();
+            let canon: Vec<PathBuf> = files
+                .iter()
+                .map(|f| std::fs::canonicalize(f).unwrap())
+                .collect();
             let mut segments = vec![];
             if keep.is_empty() {
                 for f in &canon {
                     let d = sources[f].duration;
-                    segments.push(Segment { clip: 0, path: f.clone(), start: Timestamp::ZERO, end: Timestamp::from_secs(d) });
+                    segments.push(Segment {
+                        clip: 0,
+                        path: f.clone(),
+                        start: Timestamp::ZERO,
+                        end: Timestamp::from_secs(d),
+                    });
                 }
             }
             for k in &keep {
@@ -108,43 +138,76 @@ fn main() -> Result<()> {
                     clip: file_ix as u64,
                     path: f.clone(),
                     start: Timestamp::from_secs(parse_time(a)?).snap_to_frame(fps),
-                    end: Timestamp::from_secs(parse_time(b)?.min(sources[f].duration)).snap_to_frame(fps),
+                    end: Timestamp::from_secs(parse_time(b)?.min(sources[f].duration))
+                        .snap_to_frame(fps),
                 });
             }
             let profile = match profile.as_str() {
                 "original" => Profile::original(),
                 "fit" => Profile::fit(size.context("fit needs --size MB")?),
-                id => ProfileStore::load().presets().into_iter().find(|p| p.id == id).with_context(|| format!("no profile {id:?}"))?,
+                id => ProfileStore::load()
+                    .presets()
+                    .into_iter()
+                    .find(|p| p.id == id)
+                    .with_context(|| format!("no profile {id:?}"))?,
             };
             let first = canon[0].clone();
-            let req = ExportRequest {
+            let mut req = ExportRequest {
                 segments,
                 profile,
                 output_dir: out.unwrap_or_else(|| first.parent().unwrap().to_path_buf()),
                 name: name.unwrap_or_else(|| default_name(&first)),
                 separate,
-                audio_tracks: audio.unwrap_or_else(|| if sources[&first].audio.is_empty() { vec![] } else { vec![0] }),
+                audio_tracks: audio.unwrap_or_else(|| {
+                    if sources[&first].audio.is_empty() {
+                        vec![]
+                    } else {
+                        vec![0]
+                    }
+                }),
                 overwrite,
             };
             let e = match req.profile.video.rate {
-                cutline_core::RateControl::TargetSize(mb) if !req.profile.is_copy() => match estimate::fit(&req, &sources, &tools.caps, mb, None) {
-                    estimate::FitEstimate::Original(e) | estimate::FitEstimate::Encode(e) => e,
-                    estimate::FitEstimate::TooSmall { min_mb } => bail!("Too small for this length. Try at least {min_mb} MB."),
-                },
+                cutline_core::RateControl::TargetSize(mb) if !req.profile.is_copy() => {
+                    match estimate::fit(&req, &sources, &tools.caps, mb, None) {
+                        estimate::FitEstimate::Original(e) => {
+                            // Like the export dialog: if it already fits, keep the original quality.
+                            eprintln!("Already fits in {mb} MB, so it keeps the original quality.");
+                            req.profile = Profile::original();
+                            e
+                        }
+                        estimate::FitEstimate::Encode(e) => e,
+                        estimate::FitEstimate::TooSmall { min_mb } => {
+                            bail!("Too small for this length. Try at least {min_mb} MB.")
+                        }
+                    }
+                }
                 _ if req.profile.is_copy() => estimate::original(&req, &sources, &tools.caps, None),
                 _ => estimate::encode(&req, &sources, None),
             };
             eprintln!(
                 "{}{} · {} · {}",
-                e.quality.map(|q| format!("{} · ", q.label())).unwrap_or_default(),
+                e.quality
+                    .map(|q| format!("{} · ", q.label()))
+                    .unwrap_or_default(),
                 format::length(req.total_duration()),
                 format::about_size(e.bytes),
                 format::ready_in(e.seconds)
             );
             if plan {
-                let facts = Facts { sources: sources.clone(), packets: vec![] };
+                let facts = Facts {
+                    sources: sources.clone(),
+                    packets: vec![],
+                };
                 let tmp = req.output_dir.join(".cutline-plan");
-                let p = Planner { req: &req, facts: &facts, caps: &tools.caps, tmp: &tmp, pass_log_dir: &std::env::temp_dir() }.plan()?;
+                let p = Planner {
+                    req: &req,
+                    facts: &facts,
+                    caps: &tools.caps,
+                    tmp: &tmp,
+                    pass_log_dir: &std::env::temp_dir(),
+                }
+                .plan()?;
                 for n in &p.notes {
                     println!("# {n}");
                 }
@@ -152,9 +215,15 @@ fn main() -> Result<()> {
                     println!("# → {}", o.final_path.display());
                     for s in &o.steps {
                         match s {
-                            Step::Run { label, cmd, .. } => println!("# {label}\n{}", cmd.display("ffmpeg")),
-                            Step::Write { path, contents } => println!("# write {}\n{contents}", path.display()),
-                            Step::Verify { around, .. } => println!("# verify junctions at {around:?}"),
+                            Step::Run { label, cmd, .. } => {
+                                println!("# {label}\n{}", cmd.display("ffmpeg"))
+                            }
+                            Step::Write { path, contents } => {
+                                println!("# write {}\n{contents}", path.display())
+                            }
+                            Step::Verify { around, .. } => {
+                                println!("# verify junctions at {around:?}")
+                            }
                         }
                     }
                 }
@@ -167,14 +236,26 @@ fn main() -> Result<()> {
             loop {
                 for ev in engine.poll() {
                     match ev {
-                        EngineEvent::Progress { job, fraction, eta_secs, stage } if job == id => {
+                        EngineEvent::Progress {
+                            job,
+                            fraction,
+                            eta_secs,
+                            stage,
+                        } if job == id => {
                             eprint!(
                                 "\r{stage} · {:>3.0}%{}        ",
                                 fraction * 100.0,
-                                eta_secs.map(|s| format!(" · {}", format::time_left(s))).unwrap_or_default()
+                                eta_secs
+                                    .map(|s| format!(" · {}", format::time_left(s)))
+                                    .unwrap_or_default()
                             );
                         }
-                        EngineEvent::Finished { outputs, details, seconds, .. } => {
+                        EngineEvent::Finished {
+                            outputs,
+                            details,
+                            seconds,
+                            ..
+                        } => {
                             eprintln!();
                             for n in details.notes {
                                 eprintln!("note: {n}");
@@ -186,11 +267,18 @@ fn main() -> Result<()> {
                                 eprintln!("{}", details.log);
                             }
                             for o in outputs {
-                                println!("Saved · {} · {} ({:.1} s)", format::size(o.bytes), o.path.display(), seconds);
+                                println!(
+                                    "Saved · {} · {} ({:.1} s)",
+                                    format::size(o.bytes),
+                                    o.path.display(),
+                                    seconds
+                                );
                             }
                             return Ok(());
                         }
-                        EngineEvent::Failed { message, details, .. } => {
+                        EngineEvent::Failed {
+                            message, details, ..
+                        } => {
                             eprintln!();
                             for c in &details.commands {
                                 eprintln!("$ {c}");

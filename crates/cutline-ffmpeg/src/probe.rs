@@ -100,7 +100,10 @@ pub struct MediaInfo {
 
 impl MediaInfo {
     pub fn extension(&self) -> String {
-        self.path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+        self.path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
     }
     /// Average bytes per second of the whole file, for size estimates.
     pub fn bytes_per_sec(&self) -> f64 {
@@ -115,13 +118,20 @@ impl MediaInfo {
         if let Some(b) = self.video.as_ref().and_then(|v| v.bit_rate) {
             return b as f64;
         }
-        let audio: f64 = self.audio.iter().map(|a| a.bit_rate.unwrap_or(128_000) as f64).sum();
+        let audio: f64 = self
+            .audio
+            .iter()
+            .map(|a| a.bit_rate.unwrap_or(128_000) as f64)
+            .sum();
         (self.bytes_per_sec() * 8.0 - audio).max(0.0)
     }
 }
 
 fn s(v: &Value, k: &str) -> Option<String> {
-    v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string()).filter(|x| x != "unknown")
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .map(|x| x.to_string())
+        .filter(|x| x != "unknown")
 }
 fn num<T: std::str::FromStr>(v: &Value, k: &str) -> Option<T> {
     match v.get(k)? {
@@ -145,17 +155,28 @@ pub enum ProbeError {
 }
 
 pub fn probe(tools: &Tools, path: &Path) -> Result<MediaInfo, ProbeError> {
-    let meta = std::fs::metadata(path).map_err(|e| ProbeError::Io(path.display().to_string(), e))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| ProbeError::Io(path.display().to_string(), e))?;
     let out = Command::new(&tools.ffprobe)
-        .args(["-v", "error", "-print_format", "json", "-show_format", "-show_streams"])
+        .args([
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
         .arg(path)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| ProbeError::Io(path.display().to_string(), e))?;
     if !out.status.success() {
-        return Err(ProbeError::NotMedia(String::from_utf8_lossy(&out.stderr).into_owned()));
+        return Err(ProbeError::NotMedia(
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
     }
-    let json: Value = serde_json::from_slice(&out.stdout).map_err(|e| ProbeError::NotMedia(e.to_string()))?;
+    let json: Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| ProbeError::NotMedia(e.to_string()))?;
     parse_probe(&json, path, meta.len()).ok_or_else(|| ProbeError::NotMedia("no streams".into()))
 }
 
@@ -183,12 +204,22 @@ pub fn parse_probe(json: &Value, path: &Path, size: u64) -> Option<MediaInfo> {
                     .get("side_data_list")
                     .and_then(|l| l.as_array())
                     .and_then(|l| l.iter().find_map(|sd| num::<f64>(sd, "rotation")))
-                    .or_else(|| st.get("tags").and_then(|t| num::<f64>(t, "rotate")).map(|r| -r))
+                    .or_else(|| {
+                        st.get("tags")
+                            .and_then(|t| num::<f64>(t, "rotate"))
+                            .map(|r| -r)
+                    })
                     .unwrap_or(0.0)
                     .round() as i32;
                 let pix_fmt = s(st, "pix_fmt").unwrap_or_else(|| "yuv420p".into());
-                let bit_depth = num::<u32>(st, "bits_per_raw_sample")
-                    .unwrap_or(if pix_fmt.contains("10") { 10 } else if pix_fmt.contains("12") { 12 } else { 8 });
+                let bit_depth =
+                    num::<u32>(st, "bits_per_raw_sample").unwrap_or(if pix_fmt.contains("10") {
+                        10
+                    } else if pix_fmt.contains("12") {
+                        12
+                    } else {
+                        8
+                    });
                 video = Some(VideoStream {
                     index,
                     codec: s(st, "codec_name").unwrap_or_default(),
@@ -217,11 +248,18 @@ pub fn parse_probe(json: &Value, path: &Path, size: u64) -> Option<MediaInfo> {
                     sample_rate: num(st, "sample_rate").unwrap_or(48000),
                     bit_rate: num(st, "bit_rate"),
                     language: tags.and_then(|t| s(t, "language")).filter(|l| l != "und"),
-                    title: tags.and_then(|t| s(t, "title").or_else(|| s(t, "handler_name")).filter(|h| {
-                        // mp4 handler names are usually boilerplate
-                        !matches!(h.as_str(), "SoundHandler" | "Sound Media Handler" | "Core Media Audio" | "ISO Media file produced by Google Inc.")
-                            && !h.starts_with("Mainconcept")
-                    })),
+                    title: tags.and_then(|t| {
+                        s(t, "title").or_else(|| s(t, "handler_name")).filter(|h| {
+                            // mp4 handler names are usually boilerplate
+                            !matches!(
+                                h.as_str(),
+                                "SoundHandler"
+                                    | "Sound Media Handler"
+                                    | "Core Media Audio"
+                                    | "ISO Media file produced by Google Inc."
+                            ) && !h.starts_with("Mainconcept")
+                        })
+                    }),
                 });
             }
             _ => {}
@@ -252,20 +290,36 @@ pub struct Packet {
 
 /// Video packets between `from` and `to` (seconds, `-ss` clock). ffprobe
 /// starts reading at the keyframe at or before `from`.
-pub fn packets(tools: &Tools, info: &MediaInfo, from: f64, to: f64) -> std::io::Result<Vec<Packet>> {
-    let Some(v) = &info.video else { return Ok(vec![]) };
+pub fn packets(
+    tools: &Tools,
+    info: &MediaInfo,
+    from: f64,
+    to: f64,
+) -> std::io::Result<Vec<Packet>> {
+    let Some(v) = &info.video else {
+        return Ok(vec![]);
+    };
     let abs_from = (from + info.start_time).max(0.0);
     let abs_to = to + info.start_time;
     let out = Command::new(&tools.ffprobe)
         .args(["-v", "error", "-select_streams"])
         .arg(format!("{}", v.index))
-        .args(["-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", "-read_intervals"])
+        .args([
+            "-show_entries",
+            "packet=pts_time,flags",
+            "-of",
+            "csv=p=0",
+            "-read_intervals",
+        ])
         .arg(format!("{abs_from:.6}%{abs_to:.6}"))
         .arg(&info.path)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()?;
-    Ok(parse_packets(&String::from_utf8_lossy(&out.stdout), info.start_time))
+    Ok(parse_packets(
+        &String::from_utf8_lossy(&out.stdout),
+        info.start_time,
+    ))
 }
 
 pub fn parse_packets(csv: &str, start_time: f64) -> Vec<Packet> {
@@ -274,7 +328,10 @@ pub fn parse_packets(csv: &str, start_time: f64) -> Vec<Packet> {
             let mut it = l.split(',');
             let pts: f64 = it.next()?.trim().parse().ok()?;
             let flags = it.next().unwrap_or("");
-            Some(Packet { pts: pts - start_time, key: flags.starts_with('K') })
+            Some(Packet {
+                pts: pts - start_time,
+                key: flags.starts_with('K'),
+            })
         })
         .collect()
 }

@@ -58,7 +58,8 @@ impl Clip {
             .unwrap_or_else(|| "video".into())
     }
     fn snap(&self, t: Timestamp) -> Timestamp {
-        t.snap_to_frame(self.fps).clamp(Timestamp::ZERO, self.duration)
+        t.snap_to_frame(self.fps)
+            .clamp(Timestamp::ZERO, self.duration)
     }
     fn sort(&mut self) {
         self.parts.sort_by_key(|p| p.start);
@@ -68,8 +69,20 @@ impl Clip {
         if self.parts.iter().any(|p| p.contains(t)) {
             return None;
         }
-        let lo = self.parts.iter().filter(|p| p.end <= t).map(|p| p.end).max().unwrap_or(Timestamp::ZERO);
-        let hi = self.parts.iter().filter(|p| p.start >= t).map(|p| p.start).min().unwrap_or(self.duration);
+        let lo = self
+            .parts
+            .iter()
+            .filter(|p| p.end <= t)
+            .map(|p| p.end)
+            .max()
+            .unwrap_or(Timestamp::ZERO);
+        let hi = self
+            .parts
+            .iter()
+            .filter(|p| p.start >= t)
+            .map(|p| p.start)
+            .min()
+            .unwrap_or(self.duration);
         Some((lo, hi))
     }
     fn gaps(&self) -> Vec<(Timestamp, Timestamp)> {
@@ -87,8 +100,16 @@ impl Clip {
         out
     }
     fn neighbours(&self, idx: usize) -> (Timestamp, Timestamp) {
-        let lo = if idx == 0 { Timestamp::ZERO } else { self.parts[idx - 1].end };
-        let hi = self.parts.get(idx + 1).map(|p| p.start).unwrap_or(self.duration);
+        let lo = if idx == 0 {
+            Timestamp::ZERO
+        } else {
+            self.parts[idx - 1].end
+        };
+        let hi = self
+            .parts
+            .get(idx + 1)
+            .map(|p| p.start)
+            .unwrap_or(self.duration);
         (lo, hi)
     }
     /// The ranges of this clip that end up in the export.
@@ -97,7 +118,10 @@ impl Clip {
             PartMode::Keep => self.parts.iter().map(|p| (p.start, p.end)).collect(),
             PartMode::Remove => self.gaps(),
         };
-        ranges.into_iter().filter(|(a, b)| *b - *a >= MIN_PART).collect()
+        ranges
+            .into_iter()
+            .filter(|(a, b)| *b - *a >= MIN_PART)
+            .collect()
     }
 }
 
@@ -150,12 +174,25 @@ impl Project {
     /// video starts as one part, so the two handles sit at its ends.
     pub fn add_clip(&mut self, path: PathBuf, duration: Timestamp, fps: f64) -> u64 {
         let id = self.fresh_id();
-        let mut clip = Clip { id, path, duration, fps, parts: vec![] };
+        let mut clip = Clip {
+            id,
+            path,
+            duration,
+            fps,
+            parts: vec![],
+        };
         if self.mode == PartMode::Keep {
             let pid = self.fresh_id();
-            clip.parts.push(Part { id: pid, start: Timestamp::ZERO, end: duration });
+            clip.parts.push(Part {
+                id: pid,
+                start: Timestamp::ZERO,
+                end: duration,
+            });
             if self.selected.is_none() {
-                self.selected = Some(PartRef { clip: id, part: pid });
+                self.selected = Some(PartRef {
+                    clip: id,
+                    part: pid,
+                });
             }
         }
         self.clips.push(clip);
@@ -220,8 +257,49 @@ impl Project {
         None
     }
 
+    /// Switch between keeping and removing the marked parts.
+    ///
+    /// A part that spans a whole video means "keep it all" in Keep mode but
+    /// "cut it all" in Remove mode, so those are converted: Keep → Remove
+    /// clears them (nothing marked, everything kept) and Remove → Keep gives
+    /// unmarked videos a whole-length part again. Either way what's exported
+    /// stays the same until the user marks something.
     pub fn set_mode(&mut self, mode: PartMode) {
+        if mode == self.mode {
+            return;
+        }
+        match mode {
+            PartMode::Remove => {
+                for c in &mut self.clips {
+                    if c.parts.len() == 1
+                        && c.parts[0].start == Timestamp::ZERO
+                        && c.parts[0].end == c.duration
+                    {
+                        c.parts.clear();
+                    }
+                }
+            }
+            PartMode::Keep => {
+                let mut next = self.next_id;
+                for c in &mut self.clips {
+                    if c.parts.is_empty() {
+                        next += 1;
+                        c.parts.push(Part {
+                            id: next,
+                            start: Timestamp::ZERO,
+                            end: c.duration,
+                        });
+                    }
+                }
+                self.next_id = next;
+            }
+        }
         self.mode = mode;
+        if let Some(s) = self.selected {
+            if self.part(s).is_none() {
+                self.selected = None;
+            }
+        }
     }
 
     /// Add a part at `at` (clip-local). Uses the gap under `at`, or the
@@ -248,7 +326,11 @@ impl Project {
         if end - start < MIN_PART {
             return None;
         }
-        c.parts.push(Part { id: pid, start, end });
+        c.parts.push(Part {
+            id: pid,
+            start,
+            end,
+        });
         c.sort();
         self.next_id = pid;
         let r = PartRef { clip, part: pid };
@@ -289,8 +371,12 @@ impl Project {
 
     /// Move a whole part by `delta`, keeping its length.
     pub fn shift_part(&mut self, r: PartRef, delta: Timestamp) {
-        let Some(c) = self.clip_mut(r.clip) else { return };
-        let Some(idx) = c.parts.iter().position(|p| p.id == r.part) else { return };
+        let Some(c) = self.clip_mut(r.clip) else {
+            return;
+        };
+        let Some(idx) = c.parts.iter().position(|p| p.id == r.part) else {
+            return;
+        };
         let (lo, hi) = c.neighbours(idx);
         let len = c.parts[idx].len();
         let start = (c.parts[idx].start + delta).clamp(lo, hi - len);
@@ -306,7 +392,8 @@ impl Project {
         if let Some(p) = c.parts.iter().find(|p| p.contains(t)) {
             return Some(PartRef { clip, part: p.id });
         }
-        self.selected.filter(|s| s.clip == clip && c.parts.iter().any(|p| p.id == s.part))
+        self.selected
+            .filter(|s| s.clip == clip && c.parts.iter().any(|p| p.id == s.part))
     }
 
     /// `I`: start the active part at `t`, or begin a new part there.
@@ -332,7 +419,11 @@ impl Project {
         if hi - t < MIN_PART || t < lo {
             return None;
         }
-        c.parts.push(Part { id: pid, start: t, end: hi });
+        c.parts.push(Part {
+            id: pid,
+            start: t,
+            end: hi,
+        });
         c.sort();
         self.next_id = pid;
         let r = PartRef { clip, part: pid };
@@ -362,7 +453,11 @@ impl Project {
         if t - lo < MIN_PART || t > hi {
             return None;
         }
-        c.parts.push(Part { id: pid, start: lo, end: t });
+        c.parts.push(Part {
+            id: pid,
+            start: lo,
+            end: t,
+        });
         c.sort();
         self.next_id = pid;
         let r = PartRef { clip, part: pid };
@@ -375,7 +470,12 @@ impl Project {
         let mut out = vec![];
         for c in &self.clips {
             for (start, end) in c.kept_ranges(self.mode) {
-                out.push(Segment { clip: c.id, path: c.path.clone(), start, end });
+                out.push(Segment {
+                    clip: c.id,
+                    path: c.path.clone(),
+                    start,
+                    end,
+                });
             }
         }
         out
@@ -403,7 +503,11 @@ impl Project {
     /// Is `t` (clip-local) inside something that will be exported?
     pub fn is_kept(&self, clip: u64, t: Timestamp) -> bool {
         self.clip(clip)
-            .map(|c| c.kept_ranges(self.mode).iter().any(|(a, b)| t >= *a && t < *b))
+            .map(|c| {
+                c.kept_ranges(self.mode)
+                    .iter()
+                    .any(|(a, b)| t >= *a && t < *b)
+            })
             .unwrap_or(false)
     }
 
@@ -459,7 +563,10 @@ mod tests {
         let (p, id) = one_clip();
         let segs = p.segments();
         assert_eq!(segs.len(), 1);
-        assert_eq!((segs[0].clip, segs[0].start, segs[0].end), (id, ts(0.0), ts(100.0)));
+        assert_eq!(
+            (segs[0].clip, segs[0].start, segs[0].end),
+            (id, ts(0.0), ts(100.0))
+        );
     }
 
     #[test]
@@ -490,6 +597,18 @@ mod tests {
         assert_eq!((segs[1].start, segs[1].end), (ts(20.0), ts(100.0)));
         assert!(!p.is_kept(id, ts(15.0)));
         assert_eq!(p.next_kept(id, ts(15.0)), Some((id, ts(20.0))));
+    }
+
+    #[test]
+    fn mode_switch_keeps_export_unchanged() {
+        let (mut p, id) = one_clip();
+        p.set_mode(PartMode::Remove);
+        assert_eq!(p.segments().len(), 1, "whole clip still exported");
+        let r = p.add_part(id, ts(50.0)).unwrap();
+        assert_eq!(p.segments().len(), 2, "marked part is cut out");
+        p.remove_part(r);
+        p.set_mode(PartMode::Keep);
+        assert_eq!(p.segments()[0].len(), ts(100.0));
     }
 
     #[test]

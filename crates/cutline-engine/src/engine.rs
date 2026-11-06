@@ -11,15 +11,42 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Shared slot for the UI wake-up callback.
+type WakerSlot = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
 #[derive(Debug)]
 pub enum EngineEvent {
-    Queued { job: JobId, outputs: Vec<PathBuf> },
-    Started { job: JobId },
-    Progress { job: JobId, fraction: f64, eta_secs: Option<f64>, stage: String },
-    Finished { job: JobId, outputs: Vec<JobOutput>, details: JobDetails, seconds: f64 },
-    Failed { job: JobId, message: String, details: JobDetails },
-    Canceled { job: JobId },
-    Calibrated { key: u64, calibration: Option<Calibration> },
+    Queued {
+        job: JobId,
+        outputs: Vec<PathBuf>,
+    },
+    Started {
+        job: JobId,
+    },
+    Progress {
+        job: JobId,
+        fraction: f64,
+        eta_secs: Option<f64>,
+        stage: String,
+    },
+    Finished {
+        job: JobId,
+        outputs: Vec<JobOutput>,
+        details: JobDetails,
+        seconds: f64,
+    },
+    Failed {
+        job: JobId,
+        message: String,
+        details: JobDetails,
+    },
+    Canceled {
+        job: JobId,
+    },
+    Calibrated {
+        key: u64,
+        calibration: Option<Calibration>,
+    },
 }
 
 struct Queued {
@@ -42,7 +69,7 @@ pub struct Engine {
     next_id: AtomicU64,
     calibrating: Mutex<Option<Arc<AtomicBool>>>,
     /// Called after each event is sent, to wake the UI.
-    waker: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+    waker: WakerSlot,
 }
 
 impl Engine {
@@ -50,7 +77,7 @@ impl Engine {
         let (events_tx, events) = unbounded();
         let shared: Arc<(Mutex<Shared>, std::sync::Condvar)> = Arc::default();
         let tools = Arc::new(tools);
-        let waker: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::default();
+        let waker: WakerSlot = Arc::default();
         {
             let shared = shared.clone();
             let tools = tools.clone();
@@ -61,7 +88,15 @@ impl Engine {
                 .spawn(move || worker(tools, shared, tx, waker))
                 .expect("spawn worker");
         }
-        Engine { tools, events_tx, events, shared, next_id: AtomicU64::new(1), calibrating: Mutex::new(None), waker }
+        Engine {
+            tools,
+            events_tx,
+            events,
+            shared,
+            next_id: AtomicU64::new(1),
+            calibrating: Mutex::new(None),
+            waker,
+        }
     }
 
     /// Wake the UI whenever an event arrives.
@@ -76,9 +111,15 @@ impl Engine {
     pub fn submit(&self, req: ExportRequest, outputs: Vec<PathBuf>) -> JobId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap().queue.push_back(Queued { id, req, cancel: Arc::new(AtomicBool::new(false)) });
+        lock.lock().unwrap().queue.push_back(Queued {
+            id,
+            req,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
         cv.notify_all();
-        let _ = self.events_tx.send(EngineEvent::Queued { job: id, outputs });
+        let _ = self
+            .events_tx
+            .send(EngineEvent::Queued { job: id, outputs });
         id
     }
 
@@ -125,7 +166,10 @@ impl Engine {
         std::thread::spawn(move || {
             let c = estimate::calibrate(&tools, &req, &sources, &cancel);
             if !cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(EngineEvent::Calibrated { key, calibration: c });
+                let _ = tx.send(EngineEvent::Calibrated {
+                    key,
+                    calibration: c,
+                });
                 if let Some(w) = &*waker.lock().unwrap() {
                     w();
                 }
@@ -138,7 +182,7 @@ fn worker(
     tools: Arc<Tools>,
     shared: Arc<(Mutex<Shared>, std::sync::Condvar)>,
     tx: Sender<EngineEvent>,
-    waker: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
+    waker: WakerSlot,
 ) {
     let wake = || {
         if let Some(w) = &*waker.lock().unwrap() {
@@ -160,23 +204,42 @@ fn worker(
         let _ = tx.send(EngineEvent::Started { job: next.id });
         wake();
         let started = std::time::Instant::now();
-        let job = Job { id: next.id, tools: &tools, req: &next.req, cancel: &next.cancel };
+        let job = Job {
+            id: next.id,
+            tools: &tools,
+            req: &next.req,
+            cancel: &next.cancel,
+        };
         let mut details = JobDetails::default();
         let mut last_sent = std::time::Instant::now() - std::time::Duration::from_secs(1);
         let result = job.run(
             &mut |p| {
                 if last_sent.elapsed().as_millis() >= 100 {
                     last_sent = std::time::Instant::now();
-                    let _ = tx.send(EngineEvent::Progress { job: next.id, fraction: p.fraction, eta_secs: p.eta_secs, stage: p.stage });
+                    let _ = tx.send(EngineEvent::Progress {
+                        job: next.id,
+                        fraction: p.fraction,
+                        eta_secs: p.eta_secs,
+                        stage: p.stage,
+                    });
                     wake();
                 }
             },
             &mut details,
         );
         let ev = match result {
-            Ok(outputs) => EngineEvent::Finished { job: next.id, outputs, details, seconds: started.elapsed().as_secs_f64() },
+            Ok(outputs) => EngineEvent::Finished {
+                job: next.id,
+                outputs,
+                details,
+                seconds: started.elapsed().as_secs_f64(),
+            },
             Err(JobError::Canceled) => EngineEvent::Canceled { job: next.id },
-            Err(e) => EngineEvent::Failed { job: next.id, message: e.to_string(), details },
+            Err(e) => EngineEvent::Failed {
+                job: next.id,
+                message: e.to_string(),
+                details,
+            },
         };
         {
             let (lock, _) = &*shared;

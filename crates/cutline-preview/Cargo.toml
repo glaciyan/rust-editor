@@ -1,0 +1,12 @@
+[package]
+name = "cutline-preview"
+description = "Playback (libmpv, loaded at runtime, with an ffmpeg fallback) and timeline thumbnails."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cutline-ffmpeg.workspace = true
+libloading.workspace = true
+xxhash-rust.workspace = true
+crossbeam-channel.workspace = true

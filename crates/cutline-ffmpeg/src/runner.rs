@@ -43,7 +43,10 @@ pub fn run(
     let (tx, rx) = std::sync::mpsc::channel::<f64>();
     let progress_thread = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
+            if let Some(v) = line
+                .strip_prefix("out_time_us=")
+                .or_else(|| line.strip_prefix("out_time_ms="))
+            {
                 if let Ok(us) = v.trim().parse::<i64>() {
                     let _ = tx.send(us as f64 / 1e6);
                 }
@@ -82,6 +85,9 @@ pub fn run(
         on_progress(1.0);
         Ok(log)
     } else {
-        Err(RunError::Failed { code: status.code(), log })
+        Err(RunError::Failed {
+            code: status.code(),
+            log,
+        })
     }
 }

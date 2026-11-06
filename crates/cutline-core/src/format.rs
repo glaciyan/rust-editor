@@ -33,14 +33,14 @@ pub fn length(secs: f64) -> String {
         format!("{:.0} s", s.round())
     } else if s < 3600.0 {
         let t = s.round() as u64;
-        if t % 60 == 0 {
+        if t.is_multiple_of(60) {
             format!("{} min", t / 60)
         } else {
             format!("{} min {} s", t / 60, t % 60)
         }
     } else {
         let t = (s / 60.0).round() as u64;
-        if t % 60 == 0 {
+        if t.is_multiple_of(60) {
             format!("{} h", t / 60)
         } else {
             format!("{} h {} min", t / 60, t % 60)

@@ -1,0 +1,20 @@
+[package]
+name = "cutline-gui"
+description = "Cutline: a simple video cutter. Open, drag two handles, Export."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cutline"
+path = "src/main.rs"
+
+[dependencies]
+cutline-core.workspace = true
+cutline-ffmpeg.workspace = true
+cutline-engine.workspace = true
+cutline-preview.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }

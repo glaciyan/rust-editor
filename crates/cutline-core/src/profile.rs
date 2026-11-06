@@ -28,7 +28,13 @@ impl Container {
             Container::M4a => "m4a".into(),
         }
     }
-    pub const ALL: [Container; 5] = [Container::Source, Container::Mp4, Container::Mkv, Container::Mov, Container::M4a];
+    pub const ALL: [Container; 5] = [
+        Container::Source,
+        Container::Mp4,
+        Container::Mkv,
+        Container::Mov,
+        Container::M4a,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             Container::Source => "Same as source",
@@ -52,7 +58,12 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
-    pub const ALL: [VideoCodec; 4] = [VideoCodec::Copy, VideoCodec::H265, VideoCodec::H264, VideoCodec::None];
+    pub const ALL: [VideoCodec; 4] = [
+        VideoCodec::Copy,
+        VideoCodec::H265,
+        VideoCodec::H264,
+        VideoCodec::None,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             VideoCodec::Copy => "Copy (smart cut)",
@@ -99,7 +110,12 @@ pub enum AudioCodec {
 }
 
 impl AudioCodec {
-    pub const ALL: [AudioCodec; 4] = [AudioCodec::Copy, AudioCodec::Aac, AudioCodec::Opus, AudioCodec::None];
+    pub const ALL: [AudioCodec; 4] = [
+        AudioCodec::Copy,
+        AudioCodec::Aac,
+        AudioCodec::Opus,
+        AudioCodec::None,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             AudioCodec::Copy => "Copy",
@@ -138,7 +154,8 @@ pub const FIT_ID: &str = "fit";
 
 impl Profile {
     pub fn is_fit(&self) -> bool {
-        matches!(self.video.rate, RateControl::TargetSize(_)) && self.video.codec != VideoCodec::Copy
+        matches!(self.video.rate, RateControl::TargetSize(_))
+            && self.video.codec != VideoCodec::Copy
     }
     pub fn is_copy(&self) -> bool {
         self.video.codec == VideoCodec::Copy
@@ -162,7 +179,11 @@ impl Profile {
                 max_fps: None,
                 keyframe_interval: None,
             },
-            audio: AudioSettings { codec: AudioCodec::Copy, bitrate_kbps: 192, max_channels: None },
+            audio: AudioSettings {
+                codec: AudioCodec::Copy,
+                bitrate_kbps: 192,
+                max_channels: None,
+            },
             builtin: true,
         }
     }
@@ -182,7 +203,11 @@ impl Profile {
                 max_fps: None,
                 keyframe_interval: None,
             },
-            audio: AudioSettings { codec: AudioCodec::Aac, bitrate_kbps: 128, max_channels: Some(2) },
+            audio: AudioSettings {
+                codec: AudioCodec::Aac,
+                bitrate_kbps: 128,
+                max_channels: Some(2),
+            },
             builtin: true,
         }
     }
@@ -203,7 +228,11 @@ impl Profile {
                     max_fps: None,
                     keyframe_interval: None,
                 },
-                audio: AudioSettings { codec: AudioCodec::Aac, bitrate_kbps: 128, max_channels: Some(2) },
+                audio: AudioSettings {
+                    codec: AudioCodec::Aac,
+                    bitrate_kbps: 128,
+                    max_channels: Some(2),
+                },
                 builtin: true,
             },
             Profile {
@@ -219,7 +248,11 @@ impl Profile {
                     max_fps: Some(60.0),
                     keyframe_interval: None,
                 },
-                audio: AudioSettings { codec: AudioCodec::Aac, bitrate_kbps: 160, max_channels: Some(2) },
+                audio: AudioSettings {
+                    codec: AudioCodec::Aac,
+                    bitrate_kbps: 160,
+                    max_channels: Some(2),
+                },
                 builtin: true,
             },
             Profile {
@@ -235,7 +268,11 @@ impl Profile {
                     max_fps: None,
                     keyframe_interval: Some(12),
                 },
-                audio: AudioSettings { codec: AudioCodec::Aac, bitrate_kbps: 256, max_channels: None },
+                audio: AudioSettings {
+                    codec: AudioCodec::Aac,
+                    bitrate_kbps: 256,
+                    max_channels: None,
+                },
                 builtin: true,
             },
             Profile {
@@ -251,7 +288,11 @@ impl Profile {
                     max_fps: None,
                     keyframe_interval: None,
                 },
-                audio: AudioSettings { codec: AudioCodec::Aac, bitrate_kbps: 192, max_channels: None },
+                audio: AudioSettings {
+                    codec: AudioCodec::Aac,
+                    bitrate_kbps: 192,
+                    max_channels: None,
+                },
                 builtin: true,
             },
         ]
@@ -288,7 +329,11 @@ impl Quality {
     /// For CRF-based presets: x264/x265 CRF to a plain label.
     pub fn from_crf(codec: VideoCodec, crf: u8) -> Quality {
         // x265 CRF ~ x264 CRF + 4 for similar looks.
-        let c = if codec == VideoCodec::H265 { crf.saturating_sub(4) } else { crf };
+        let c = if codec == VideoCodec::H265 {
+            crf.saturating_sub(4)
+        } else {
+            crf
+        };
         match c {
             0..=19 => Quality::Great,
             20..=24 => Quality::Good,
