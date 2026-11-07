@@ -116,7 +116,7 @@ pub struct CutlineApp {
 
 const HEADER_H: f32 = 52.0;
 const STATUS_H: f32 = 32.0;
-const TRANSPORT_H: f32 = 60.0;
+const TRANSPORT_H: f32 = 68.0;
 
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -2127,6 +2127,10 @@ impl eframe::App for CutlineApp {
                     }),
             )
             .show(ui, |ui| {
+                // No item spacing here: the transport row's own height is the
+                // gap, so the play button sits centred between the viewer and
+                // the editor panel instead of spilling into it.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 let h = (ui.available_height() - TRANSPORT_H).max(120.0);
                 self.viewer(ui, h);
                 self.transport(ui);
