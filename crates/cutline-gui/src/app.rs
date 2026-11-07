@@ -1179,13 +1179,7 @@ impl CutlineApp {
             );
             return;
         }
-        resp.widget_info(|| {
-            WidgetInfo::labeled(
-                Role::Button,
-                true,
-                if self.playing() { "Pause" } else { "Play" },
-            )
-        });
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Preview"));
         // Render the next frame at the on-screen pixel size.
         let ppp = ui.ctx().pixels_per_point();
         let (mw, mh) = (
@@ -1272,7 +1266,7 @@ impl CutlineApp {
 
     fn empty_state(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let p = ui.painter_at(rect);
-        let r = rect.shrink(4.0);
+        let r = rect.shrink(16.0);
         let pts = vec![
             r.left_top(),
             r.right_top(),
@@ -2179,7 +2173,7 @@ impl CutlineApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::VIEWER)
-                    .inner_margin(egui::Margin::same(16)),
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ui, |ui| self.viewer(ui));
 
@@ -2235,6 +2229,12 @@ impl CutlineApp {
             TimelineAction::AddPart(c, t) => {
                 self.checkpoint();
                 if self.project.add_part(c, t).is_none() {
+                    self.undo.pop();
+                }
+            }
+            TimelineAction::SplitAt(c, t) => {
+                self.checkpoint();
+                if self.project.split_part(c, t).is_none() {
                     self.undo.pop();
                 }
             }
