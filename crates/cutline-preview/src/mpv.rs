@@ -360,8 +360,9 @@ impl MpvPlayer {
                 return None;
             }
             let mut rgba = self.buf.clone();
-            for px in rgba.chunks_exact_mut(4) {
-                px[3] = 255;
+            // Force every alpha byte opaque (RGBA, so bytes 3, 7, 11, …).
+            for a in rgba.iter_mut().skip(3).step_by(4) {
+                *a = 255;
             }
             Some(Frame {
                 width: w,
