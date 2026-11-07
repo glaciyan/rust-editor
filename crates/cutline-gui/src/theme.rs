@@ -82,6 +82,13 @@ fn install_fonts(ctx: &egui::Context) {
         );
         strong.insert(0, "ui-semibold".into());
     }
+    // Last resort for symbols: of egui's bundled fonts only Hack has arrows
+    // (the ← → hints), and desktop UI fonts such as Noto Sans may not.
+    for family in [&mut proportional, &mut strong] {
+        if !family.iter().any(|f| f == "Hack") {
+            family.push("Hack".into());
+        }
+    }
     fonts
         .families
         .insert(FontFamily::Proportional, proportional);
