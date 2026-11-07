@@ -12,26 +12,29 @@ handles, press **Export**. No settings needed.
    with thumbnails. Several videos are laid end to end.
 2. **Trim.** Drag the start and end handles, or press `I` and `O` while it
    plays. The preview follows the handle you're dragging, so you see the exact
-   frame you're cutting on. *+ Add part* marks more parts; *Keep selected* /
-   *Remove selected* decides whether the marked parts are what you keep or what
-   you cut out. The volume slider next to the transport (or `↑` / `↓`, `M` to
+   frame you're cutting on. **Split** (`S`) cuts the part under the playhead
+   in two and **Delete part** (`Del`) throws the selected one away, so
+   *Split, Split, Delete* cuts a stretch out of the middle. Right-click the
+   timeline to switch to cutting out the marked parts instead of keeping
+   them. The volume slider next to the transport (or `↑` / `↓`, `M` to
    mute) sets how loud the preview plays; it's remembered between runs and
    never changes the exported file.
-3. **Export** (`Ctrl+E`). The dialog opens with *Original quality* selected, so
-   Save finishes in seconds for most files and the result is saved next to the
-   source as `<name> (cut).<ext>`.
+3. **Export** (`Ctrl+E`). The dialog opens with *Original quality* picked, so
+   Export finishes in seconds for most files and the result is saved next to
+   the source as `<name> (cut).<ext>`.
 
-The export dialog offers three plain choices:
+The export dialog is one list; every row shows how big the file comes out and
+how long it takes:
 
 | Choice | What it does |
 | --- | --- |
 | **Original quality** (default) | Copies the video without re-encoding. Only the few frames between each cut and the next keyframe are re-encoded, so cuts land on the exact frame. |
 | **Fit to size** | Type a size in MB. Cutline shows a quality label and a time estimate before you save, and the file never comes out bigger than that size. |
-| **Presets** | Named options: *Smaller file*, *Plays anywhere*, *For editing*, *Audio only*, plus your own. |
+| **Smaller file**, **Plays anywhere**, **For editing**, **Audio only** | Named presets. |
+| **Yours** | Profiles you made with *New profile…* (container, codec, size or quality, resolution, frame rate, audio). Right-click one to edit or delete it. |
 
-Codecs, resolution, frame rate and bitrate only appear in **Advanced…**, the
-profile editor. A finished export's **Details** shows the exact ffmpeg
-commands and the log.
+Codecs, resolution, frame rate and bitrate only appear in **New profile…**. A
+finished export's **Details** shows the exact ffmpeg commands and the log.
 
 **Safe by default:** an export writes into a hidden scratch folder and only
 moves the finished file into place at the end, so Cancel (or a crash) never
@@ -45,6 +48,7 @@ launch.
 | --- | --- |
 | `Space` | Play / pause |
 | `I` / `O` | Set the start / end of the part under the playhead (or start a new part) |
+| `S` | Split the part under the playhead |
 | `A` | Add a part at the playhead |
 | `Delete` | Remove the selected part |
 | `←` / `→` | One frame back / forward |
@@ -54,9 +58,14 @@ launch.
 | `M` | Mute / unmute the preview |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+O` / `Ctrl+E` | Open / Export |
+| `Esc` / `Enter` | Close / confirm the dialog on top (New profile goes back to Export) |
 
 Double-click an empty stretch of the timeline to add a part there. Right-click
 it to remove a part, reorder videos or take one off the timeline.
+
+Cutline draws its own title bar (the window buttons sit next to Export; drag
+the header to move the window, double-click it to maximize, drag an edge to
+resize). Run with `CUTLINE_SYSTEM_TITLEBAR=1` to keep your desktop's instead.
 
 ## Installing
 
@@ -136,7 +145,8 @@ would produce, it keeps the original instead.
 ## Development
 
 ```bash
-cargo test --workspace    # unit tests + end-to-end exports (skipped without ffmpeg)
+cargo test --workspace    # unit tests, UI tests, end-to-end exports (skipped without ffmpeg)
+cargo test -p cutline-gui ui_tests   # just the UI tests: the real window driven headlessly
 cargo clippy --workspace --all-targets
 CUTLINE_NO_MPV=1 cargo run -p cutline-gui -- clip.mp4   # try the ffmpeg-only preview
 ```
