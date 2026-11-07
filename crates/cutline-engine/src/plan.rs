@@ -1332,7 +1332,29 @@ pub fn fit_input(
 ) -> fit::FitInput {
     let first = segs.first().and_then(|s| sources.get(&s.path));
     let v = first.and_then(|m| m.video.as_ref());
-    let (w, h) = v.map(|v| v.display_size()).unwrap_or((0, 0));
+    let (mut w, mut h) = v.map(|v| v.display_size()).unwrap_or((0, 0));
+    let mut fps = v.map(|v| v.fps).unwrap_or(0.0);
+    // The profile's caps come first: the solver only ever goes down from
+    // them, the same way the planner applies them (`max_fps` halves the
+    // rate when that's enough, else uses the cap).
+    let mut capped = false;
+    if let Some(cap) = req.profile.video.max_height {
+        if h > cap {
+            w = even(w as f64 * cap as f64 / h as f64);
+            h = cap;
+            capped = true;
+        }
+    }
+    if let Some(cap) = req.profile.video.max_fps {
+        if fps > cap + 0.01 {
+            fps = if fps / 2.0 <= cap + 0.01 {
+                fps / 2.0
+            } else {
+                cap
+            };
+            capped = true;
+        }
+    }
     let tracks: Vec<usize> = first
         .map(|m| {
             req.audio_tracks
@@ -1350,7 +1372,7 @@ pub fn fit_input(
         duration,
         src_width: if audio_only { 0 } else { w },
         src_height: if audio_only { 0 } else { h },
-        src_fps: v.map(|v| v.fps).unwrap_or(0.0),
+        src_fps: fps,
         src_video_bps: first.map(|m| m.video_bitrate()).filter(|b| *b > 0.0),
         audio_channels: tracks
             .iter()
@@ -1362,7 +1384,7 @@ pub fn fit_input(
             .collect(),
         codec,
         original_bytes,
-        original_possible: original_possible && !audio_only,
+        original_possible: original_possible && !audio_only && !capped,
     }
 }
 
@@ -1691,6 +1713,46 @@ mod tests {
         assert!(cmds[1].contains("pass=2") && cmds[1].contains("-c:a:0 aac"));
         let fit = o.fit.as_ref().unwrap();
         assert!(fit.settings.expected_bytes <= 10e6 * (1.0 - fit::MARGIN) + 1.0);
+    }
+
+    #[test]
+    fn fit_keeps_a_profiles_size_and_rate_caps() {
+        // A 1440p60 source into a "720p, 30 fps, under N MB" profile: at
+        // every budget the picture stays within the caps (the solver may
+        // still go smaller).
+        let mut src = info("/v/a.mp4", "hevc", 2560, 1440);
+        let v = src.video.as_mut().unwrap();
+        (v.fps, v.fps_num) = (60.0, 60);
+        let facts = Facts {
+            sources: [("/v/a.mp4".into(), src)].into(),
+            packets: vec![],
+        };
+        let tmp = PathBuf::from("/tmp/x");
+        for mb in [2.0, 5.0, 8.0, 30.0] {
+            let mut p = Profile::fit(mb);
+            p.video.max_height = Some(720);
+            p.video.max_fps = Some(30.0);
+            let r = req(p, vec![("/v/a.mp4", 0.0, 20.0)]);
+            let plan = Planner {
+                req: &r,
+                facts: &facts,
+                caps: &caps(),
+                tmp: &tmp,
+                pass_log_dir: &tmp,
+            }
+            .plan()
+            .unwrap();
+            let cmd = &all_args(&plan.outputs[0])[1];
+            let scale = cmd.split("scale=").nth(1).unwrap();
+            let (sw, rest) = scale.split_once(':').unwrap();
+            let sh: u32 = rest.split(':').next().unwrap().parse().unwrap();
+            assert!(
+                sh <= 720 && sw.parse::<u32>().unwrap() <= 1280,
+                "{mb} MB: {cmd}"
+            );
+            let fps = cmd.split("fps=").nth(1).unwrap().split('/').next().unwrap();
+            assert!(fps.parse::<f64>().unwrap() <= 30.0, "{mb} MB: {cmd}");
+        }
     }
 
     #[test]
