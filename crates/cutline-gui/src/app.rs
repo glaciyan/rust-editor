@@ -1959,8 +1959,11 @@ fn timecode(secs: f64, fps: f64) -> String {
     let total_frames = (s * fps).round() as u64;
     let f = total_frames % fps_i;
     let whole = total_frames / fps_i;
+    // Pad the frame field to the widest frame number at this rate (`119` at
+    // 120 fps), so the readout keeps one width while it plays.
+    let fw = (fps_i - 1).max(10).to_string().len();
     format!(
-        "{:02}:{:02}:{:02}:{:02}",
+        "{:02}:{:02}:{:02}:{:0fw$}",
         whole / 3600,
         (whole / 60) % 60,
         whole % 60,
@@ -2255,6 +2258,9 @@ mod tests {
         // 29.97 fps counts 30 frame numbers per second.
         assert_eq!(timecode(0.95, 29.97), "00:00:00:28");
         assert_eq!(timecode(f64::NAN, 30.0), "00:00:00:00");
+        // High frame rates keep a fixed-width frame field.
+        assert_eq!(timecode(0.25, 120.0), "00:00:00:030");
+        assert_eq!(timecode(0.9, 120.0), "00:00:00:108");
     }
 
     #[test]
