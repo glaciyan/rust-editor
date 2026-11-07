@@ -1,6 +1,6 @@
 [package]
 name = "cutline-engine"
-description = "Export planning (pure), the fit-to-size solver, estimates, the job queue, profile and session stores."
+description = "Export planning (pure), the fit-to-size solver, estimates, the job queue, and JSON stores."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

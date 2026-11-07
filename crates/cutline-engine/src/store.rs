@@ -1,7 +1,6 @@
-//! Where Cutline keeps things between runs: user profiles, the last
-//! session, and caches. All plain JSON in the XDG directories.
+//! Where Cutline keeps things between runs: user settings, profiles, and caches.
 
-use cutline_core::{Profile, Project};
+use cutline_core::Profile;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -31,10 +30,6 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
-    pub project: Project,
-    /// Playhead, as (clip id, seconds into that clip).
-    #[serde(default)]
-    pub playhead: Option<(u64, f64)>,
     /// Last folder exported to.
     #[serde(default)]
     pub last_export_dir: Option<PathBuf>,
@@ -52,8 +47,6 @@ fn default_volume() -> f64 {
 impl Default for Session {
     fn default() -> Self {
         Session {
-            project: Project::default(),
-            playhead: None,
             last_export_dir: None,
             volume: default_volume(),
             muted: false,
@@ -67,20 +60,7 @@ pub fn session_path() -> PathBuf {
 
 pub fn load_session() -> Option<Session> {
     let bytes = std::fs::read(session_path()).ok()?;
-    let mut s: Session = serde_json::from_slice(&bytes).ok()?;
-    // Drop videos that have gone away since.
-    let gone: Vec<u64> = s
-        .project
-        .clips
-        .iter()
-        .filter(|c| !c.path.exists())
-        .map(|c| c.id)
-        .collect();
-    for id in gone {
-        s.project.remove_clip(id);
-    }
-    s.project.normalise();
-    Some(s)
+    serde_json::from_slice(&bytes).ok()
 }
 
 pub fn save_session(s: &Session) -> std::io::Result<()> {

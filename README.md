@@ -36,11 +36,11 @@ how long it takes:
 Codecs, resolution, frame rate and bitrate only appear in **New profile…**. A
 finished export's **Details** shows the exact ffmpeg commands and the log.
 
-**Safe by default:** an export writes into a hidden scratch folder and only
+*Safe by default:** an export writes into a hidden scratch folder and only
 moves the finished file into place at the end, so Cancel (or a crash) never
 leaves a broken file. Nothing is overwritten without asking (*Replace* or
-*Keep both*), and the last session (videos, parts, playhead) comes back on
-launch.
+*Keep both*). Preferences such as volume and the last export folder persist
+between launches.
 
 ### Keys
 
@@ -119,7 +119,7 @@ cutline-gui (eframe/egui)      cutline-cli (clap)
   facts about the sources to the exact list of ffmpeg steps, so every decision
   is unit tested. The engine also holds the fit-to-size solver, the size and
   time estimates (refined by a 3-second sample encode), the background job
-  queue, and the JSON stores for profiles and the session (XDG directories).
+  queue, and the JSON stores for profiles and settings (XDG directories).
 * **cutline-preview**: playback through libmpv's software renderer (loaded at
   run time, so Cutline starts without it), with an ffmpeg-only fallback, plus
   disk-cached timeline thumbnails.

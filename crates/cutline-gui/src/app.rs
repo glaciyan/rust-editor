@@ -56,7 +56,6 @@ enum Probed {
     Ok {
         path: PathBuf,
         info: Box<MediaInfo>,
-        restore: bool,
     },
     Err {
         path: PathBuf,
@@ -190,13 +189,12 @@ impl CutlineApp {
         theme::apply(&cc.egui_ctx);
         let mut app = Self::assemble(&cc.egui_ctx, Tools::locate(), true, csd);
         if let Some(s) = store::load_session() {
+            app.last_export_dir = s.last_export_dir;
             app.volume = s.volume.clamp(0.0, 100.0);
             app.muted = s.muted;
         }
         app.apply_volume();
-        if args.is_empty() {
-            app.restore_session();
-        } else {
+        if !args.is_empty() {
             app.add_files(args);
         }
         app
@@ -292,29 +290,10 @@ impl CutlineApp {
         }
     }
 
-    // ---------- files & session ----------
-
-    fn restore_session(&mut self) {
-        let Some(s) = store::load_session() else {
-            return;
-        };
-        self.last_export_dir = s.last_export_dir.clone();
-        self.saved_session = serde_json::to_string(&s).ok();
-        if s.project.is_empty() {
-            return;
-        }
-        self.project = s.project;
-        self.playhead = s.playhead.map(|(c, t)| (c, Timestamp::from_secs(t)));
-        let paths: Vec<PathBuf> = self.project.clips.iter().map(|c| c.path.clone()).collect();
-        for p in paths {
-            self.spawn_probe(p, true);
-        }
-    }
+    // ---------- files & settings ----------
 
     fn session(&self) -> Session {
         Session {
-            project: self.project.clone(),
-            playhead: self.playhead.map(|(c, t)| (c, t.secs())),
             last_export_dir: self.last_export_dir.clone(),
             volume: self.volume,
             muted: self.muted,
@@ -336,20 +315,17 @@ impl CutlineApp {
         }
     }
 
-    fn spawn_probe(&mut self, path: PathBuf, restore: bool) {
+    fn spawn_probe(&mut self, path: PathBuf) {
         let Some(tools) = self.tools.clone() else {
             return;
         };
         let tx = self.probe_tx.clone();
-        if !restore {
-            self.pending.push(path.clone());
-        }
+        self.pending.push(path.clone());
         std::thread::spawn(move || {
             let r = match probe::probe(&tools, &path) {
                 Ok(info) if info.video.is_some() => Probed::Ok {
                     path,
                     info: Box::new(info),
-                    restore,
                 },
                 Ok(_) => Probed::Err {
                     path,
@@ -367,7 +343,7 @@ impl CutlineApp {
     /// Add videos in the given order.
     pub fn add_files(&mut self, files: Vec<PathBuf>) {
         for f in files.into_iter().filter(|p| p.is_file()) {
-            self.spawn_probe(f, false);
+            self.spawn_probe(f);
         }
     }
 
@@ -377,10 +353,9 @@ impl CutlineApp {
                 Probed::Ok {
                     path,
                     info,
-                    restore,
                 } => {
                     if let Some(v) = &info.video {
-                        if v.codec != "hevc" && v.codec != "h264" && !restore {
+                        if v.codec != "hevc" && v.codec != "h264" {
                             self.toast(format!(
                                 "{} isn't an H.265 video. Cuts in it land on the nearest keyframe.",
                                 path.file_name().unwrap_or_default().to_string_lossy()
@@ -388,37 +363,6 @@ impl CutlineApp {
                         }
                     }
                     self.sources.insert(path.clone(), *info);
-                    if restore {
-                        // Session restore: the clip is already in the project.
-                        if self.loaded.is_none()
-                            && self
-                                .project
-                                .clips
-                                .first()
-                                .map(|c| c.path == path)
-                                .unwrap_or(false)
-                        {
-                            let (clip, t) = self
-                                .playhead
-                                .unwrap_or((self.project.clips[0].id, Timestamp::ZERO));
-                            let clip = if self.project.clip(clip).is_some() {
-                                clip
-                            } else {
-                                self.project.clips[0].id
-                            };
-                            self.load_clip(clip, t, false);
-                        } else if let Some((pc, t)) = self.playhead {
-                            if self.loaded.is_none()
-                                && self
-                                    .project
-                                    .clip(pc)
-                                    .map(|c| c.path == path)
-                                    .unwrap_or(false)
-                            {
-                                self.load_clip(pc, t, false);
-                            }
-                        }
-                    }
                 }
                 Probed::Err { path, message } => {
                     self.pending.retain(|p| p != &path);
