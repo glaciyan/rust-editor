@@ -30,6 +30,9 @@ pub enum Icon {
     /// Two overlapping squares: the window is maximized.
     Restore,
     ChevronDown,
+    ArrowLeft,
+    ArrowRight,
+    Pencil,
 }
 
 impl Icon {
@@ -213,6 +216,32 @@ impl Icon {
             }
             Icon::ChevronDown => {
                 p.add(path(vec![at(4.0, 6.0), at(8.0, 10.0), at(12.0, 6.0)]));
+            }
+            Icon::ArrowLeft | Icon::ArrowRight => {
+                let fx = |x: f32| {
+                    if self == Icon::ArrowRight {
+                        16.0 - x
+                    } else {
+                        x
+                    }
+                };
+                p.add(path(vec![at(fx(13.0), 8.0), at(fx(3.0), 8.0)]));
+                p.add(path(vec![
+                    at(fx(7.0), 4.0),
+                    at(fx(3.0), 8.0),
+                    at(fx(7.0), 12.0),
+                ]));
+            }
+            Icon::Pencil => {
+                p.add(path(vec![
+                    at(10.5, 2.5),
+                    at(13.5, 5.5),
+                    at(5.5, 13.5),
+                    at(2.5, 13.5),
+                    at(2.5, 10.5),
+                    at(10.5, 2.5),
+                ]));
+                p.add(path(vec![at(8.8, 4.2), at(11.8, 7.2)]));
             }
         }
     }

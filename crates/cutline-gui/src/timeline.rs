@@ -3,6 +3,7 @@
 //! end), part labels underneath, and the playhead.
 
 use crate::app::CutlineApp;
+use crate::icons::Icon;
 use crate::theme::{self, ACCENT, MUTED, ON_ACCENT};
 use cutline_core::{format, Handle, PartMode, PartRef, Timestamp};
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke};
@@ -39,6 +40,7 @@ pub enum TimelineAction {
     RemoveClip(u64),
     MoveClip(u64, isize),
     AddPart(u64, Timestamp),
+    SplitAt(u64, Timestamp),
     RemovePart(PartRef),
     SetMode(PartMode),
 }
@@ -521,6 +523,13 @@ fn interact(
     if resp.secondary_clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             app.timeline.menu_at = locate(app, p.x);
+            // Right-clicking a part selects it, so the menu's Delete part
+            // (and the Del key) act on the part under the pointer.
+            if let Some((c, t)) = app.timeline.menu_at {
+                if let Some(r) = part_at(app, c, t) {
+                    app.project.selected = Some(r);
+                }
+            }
         }
     }
     let mut action = TimelineAction::None;
@@ -528,51 +537,55 @@ fn interact(
         let Some((c, t)) = app.timeline.menu_at else {
             return;
         };
-        let part = part_at(app, c, t);
-        let multi = app.project.clips.len() > 1;
-        if part.is_none() && ui.button("Add part here").clicked() {
-            action = TimelineAction::AddPart(c, t);
+        theme::menu(ui);
+        let mut pick = |a: TimelineAction, ui: &mut egui::Ui| {
+            action = a;
             ui.close();
-        }
-        if let Some(r) = part {
-            if ui.button("Remove this part").clicked() {
-                action = TimelineAction::RemovePart(r);
-                ui.close();
-            }
-        }
-        ui.separator();
-        let (text, other) = match app.project.mode {
-            PartMode::Keep => ("Cut out the marked parts instead", PartMode::Remove),
-            PartMode::Remove => ("Keep only the marked parts", PartMode::Keep),
         };
-        if ui.button(text).clicked() {
-            action = TimelineAction::SetMode(other);
-            ui.close();
+        match part_at(app, c, t) {
+            Some(r) => {
+                let mut trial = app.project.clone();
+                ui.add_enabled_ui(trial.split_part(c, t).is_some(), |ui| {
+                    if theme::menu_item(ui, Icon::Scissors, "Split here", None).clicked() {
+                        pick(TimelineAction::SplitAt(c, t), ui);
+                    }
+                });
+                if theme::menu_danger(ui, Icon::Trash, "Delete part", Some("Del")).clicked() {
+                    pick(TimelineAction::RemovePart(r), ui);
+                }
+            }
+            None => {
+                if theme::menu_item(ui, Icon::Plus, "Add part here", Some("Double-click")).clicked()
+                {
+                    pick(TimelineAction::AddPart(c, t), ui);
+                }
+            }
         }
-        if multi {
-            ui.separator();
+        theme::menu_separator(ui);
+        theme::menu_caption(ui, "Marked parts");
+        let mode = app.project.mode;
+        if theme::menu_choice(ui, mode == PartMode::Keep, "Keep them").clicked() {
+            pick(TimelineAction::SetMode(PartMode::Keep), ui);
+        }
+        if theme::menu_choice(ui, mode == PartMode::Remove, "Cut them out").clicked() {
+            pick(TimelineAction::SetMode(PartMode::Remove), ui);
+        }
+        theme::menu_separator(ui);
+        if app.project.clips.len() > 1 {
             let idx = app.project.clip_index(c).unwrap_or(0);
-            if ui
-                .add_enabled(idx > 0, egui::Button::new("Move video earlier"))
-                .clicked()
-            {
-                action = TimelineAction::MoveClip(c, -1);
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    idx + 1 < app.project.clips.len(),
-                    egui::Button::new("Move video later"),
-                )
-                .clicked()
-            {
-                action = TimelineAction::MoveClip(c, 1);
-                ui.close();
-            }
+            ui.add_enabled_ui(idx > 0, |ui| {
+                if theme::menu_item(ui, Icon::ArrowLeft, "Move video earlier", None).clicked() {
+                    pick(TimelineAction::MoveClip(c, -1), ui);
+                }
+            });
+            ui.add_enabled_ui(idx + 1 < app.project.clips.len(), |ui| {
+                if theme::menu_item(ui, Icon::ArrowRight, "Move video later", None).clicked() {
+                    pick(TimelineAction::MoveClip(c, 1), ui);
+                }
+            });
         }
-        if ui.button("Remove video from timeline").clicked() {
-            action = TimelineAction::RemoveClip(c);
-            ui.close();
+        if theme::menu_danger(ui, Icon::Close, "Remove video from timeline", None).clicked() {
+            pick(TimelineAction::RemoveClip(c), ui);
         }
     });
     action

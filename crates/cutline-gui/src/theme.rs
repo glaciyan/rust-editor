@@ -722,3 +722,122 @@ pub fn progress_bar(ui: &mut Ui, fraction: f32, width: f32) {
     f.set_width(width * fraction.clamp(0.0, 1.0));
     ui.painter().rect_filled(f, 2, ACCENT);
 }
+
+// ---------- menus ----------
+
+const MENU_W: f32 = 248.0;
+
+/// Start a right-click menu: its width and row spacing.
+pub fn menu(ui: &mut Ui) {
+    ui.set_min_width(MENU_W);
+    ui.set_max_width(MENU_W);
+    ui.spacing_mut().item_spacing.y = 0.0;
+}
+
+/// One menu row: icon, label, and a shortcut hint on the right. `danger`
+/// rows (deleting, removing) turn red when hovered.
+pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str, hint: Option<&str>) -> Response {
+    menu_row(ui, Some(icon), None, label, hint, false)
+}
+
+pub fn menu_danger(ui: &mut Ui, icon: Icon, label: &str, hint: Option<&str>) -> Response {
+    menu_row(ui, Some(icon), None, label, hint, true)
+}
+
+/// A row that's one of a few choices, checked when it's the current one.
+pub fn menu_choice(ui: &mut Ui, on: bool, label: &str) -> Response {
+    menu_row(ui, None, Some(on), label, None, false)
+}
+
+/// A small caption over a group of rows.
+pub fn menu_caption(ui: &mut Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 24.0), Sense::hover());
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                rect.min + egui::vec2(10.0, 6.0),
+                rect.max,
+            ))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.label(
+        egui::RichText::new(text.to_uppercase())
+            .size(10.5)
+            .extra_letter_spacing(0.7)
+            .color(MUTED),
+    );
+}
+
+pub fn menu_separator(ui: &mut Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(MENU_W, 9.0), Sense::hover());
+    ui.painter().hline(
+        rect.x_range().shrink(4.0),
+        rect.center().y,
+        Stroke::new(1.0, HAIRLINE),
+    );
+}
+
+fn menu_row(
+    ui: &mut Ui,
+    icon: Option<Icon>,
+    check: Option<bool>,
+    label: &str,
+    hint: Option<&str>,
+    danger: bool,
+) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(MENU_W, 30.0), Sense::click());
+    let enabled = ui.is_enabled();
+    match check {
+        Some(on) => {
+            resp.widget_info(|| WidgetInfo::selected(Role::MenuItemRadio, enabled, on, label))
+        }
+        None => resp.widget_info(|| WidgetInfo::labeled(Role::MenuItem, enabled, label)),
+    }
+    let hovered = enabled && resp.hovered();
+    let p = ui.painter();
+    if hovered {
+        let fill = if danger {
+            Color32::from_rgba_unmultiplied(0xf5, 0x80, 0x6f, 34)
+        } else {
+            HOVER
+        };
+        p.rect_filled(rect, 6, fill);
+    }
+    let (fg, icon_fg) = match (enabled, hovered, danger) {
+        (false, ..) => (FAINT, FAINT),
+        (true, true, true) => (DANGER, DANGER),
+        (true, true, false) => (TEXT, TEXT),
+        (true, false, _) => (TEXT, MUTED),
+    };
+    let slot = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 10.0 + 8.0, rect.center().y),
+        egui::vec2(15.0, 15.0),
+    );
+    if let Some(icon) = icon {
+        icon.paint(p, slot, icon_fg);
+    }
+    if check == Some(true) {
+        Icon::Check.paint(p, slot, if enabled { ACCENT } else { FAINT });
+    }
+    let g = p.layout_no_wrap(label.to_string(), FontId::proportional(13.0), fg);
+    p.galley(
+        egui::pos2(rect.left() + 36.0, rect.center().y - g.size().y / 2.0),
+        g,
+        fg,
+    );
+    if let Some(hint) = hint {
+        let g = p.layout_no_wrap(hint.to_string(), FontId::proportional(12.0), MUTED);
+        p.galley(
+            egui::pos2(
+                rect.right() - 10.0 - g.size().x,
+                rect.center().y - g.size().y / 2.0,
+            ),
+            g,
+            if enabled { MUTED } else { FAINT },
+        );
+    }
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}

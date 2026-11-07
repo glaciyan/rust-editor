@@ -731,3 +731,75 @@ fn text_sits_in_the_middle_of_its_box() {
     assert_text_centred_in(&h, "Name");
     assert_text_centred_in(&h, "Quality, 0 best to 51 worst");
 }
+
+// ---------- the picture and the timeline's menu ----------
+
+#[test]
+fn the_picture_fills_the_space_between_header_and_transport() {
+    let h = editor();
+    let view = control(&h, "Preview");
+    // The timeline sits 20 px in from each side of the panel the picture spans.
+    let timeline = control(&h, "Timeline").rect();
+    assert_eq!(view.rect().width(), timeline.width() + 40.0);
+    let undo = control(&h, "Undo").rect();
+    let prev = control(&h, "Previous frame").rect();
+    // Straight under the header, straight over the transport.
+    assert!((view.rect().top() - (undo.center().y + 24.0)).abs() <= 1.0);
+    assert!((view.rect().bottom() - (prev.center().y - 24.0)).abs() <= 1.0);
+}
+
+/// Right-click the timeline `secs` into the video.
+fn timeline_menu_at(h: &mut Harness<'_, CutlineApp>, secs: f64) {
+    let r = control(h, "Timeline").rect();
+    let total = h.state().project.total_duration().secs();
+    let x = r.left() + (secs / total) as f32 * r.width();
+    let pos = egui::pos2(x, r.bottom() - 20.0);
+    h.hover_at(pos);
+    h.run();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    h.run();
+}
+
+#[test]
+fn timeline_menu_splits_deletes_and_switches_mode() {
+    let mut h = editor();
+    timeline_menu_at(&mut h, 6.0);
+    click(&mut h, "Split here");
+    let p = parts(&h);
+    assert_eq!(p.len(), 2);
+    assert!((p[0].1 - 6.0).abs() < 0.05, "{p:?}");
+    assert!(
+        !has_control(&h, "Split here"),
+        "the menu closes after a pick"
+    );
+
+    // Right-clicking a part selects it, so Delete part acts on that one.
+    timeline_menu_at(&mut h, 2.0);
+    let first = h.state().project.clips[0].parts[0].id;
+    assert_eq!(h.state().project.selected.map(|r| r.part), Some(first));
+    click(&mut h, "Delete part");
+    assert_eq!(parts(&h).len(), 1);
+    assert!(parts(&h)[0].0 > 5.0);
+
+    timeline_menu_at(&mut h, 10.0);
+    assert!(is_on(&control(&h, "Keep them")));
+    click(&mut h, "Cut them out");
+    assert_eq!(h.state().project.mode, PartMode::Remove);
+}
+
+#[test]
+fn esc_closes_the_timeline_menu_only() {
+    let mut h = editor();
+    timeline_menu_at(&mut h, 6.0);
+    assert!(has_control(&h, "Split here"));
+    press(&mut h, Key::Escape);
+    assert!(!has_control(&h, "Split here"));
+    assert_eq!(parts(&h).len(), 1);
+}

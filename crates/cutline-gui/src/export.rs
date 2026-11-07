@@ -388,13 +388,13 @@ impl ExportDialog {
                                     self.picked = p.id.clone();
                                 }
                                 r.context_menu(|ui| {
-                                    if ui.button("Edit…").clicked() {
+                                    theme::menu(ui);
+                                    if theme::menu_item(ui, Icon::Pencil, "Edit…", None).clicked()
+                                    {
                                         edit_profile = Some(p.id.clone());
                                         ui.close();
                                     }
-                                    if ui
-                                        .button(egui::RichText::new("Delete").color(theme::DANGER))
-                                        .clicked()
+                                    if theme::menu_danger(ui, Icon::Trash, "Delete", None).clicked()
                                     {
                                         delete_profile = Some(p.id.clone());
                                         ui.close();
