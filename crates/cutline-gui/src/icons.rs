@@ -221,3 +221,107 @@ pub fn logo(p: &Painter, rect: Rect) {
         Stroke::NONE,
     ));
 }
+
+/// [`logo`] as a window icon, rasterised in software (4×4 samples a pixel)
+/// since there's no GPU before the window exists. Shown by X11 window
+/// managers; Wayland compositors take the icon from the desktop file.
+pub fn window_icon(size: u32) -> egui::IconData {
+    use crate::theme::{BORDER, RAISED, TRIM};
+    // In the logo's 24-unit space.
+    let radius = 24.0 * 0.26;
+    let in_rounded = |x: f32, y: f32, inset: f32| {
+        let (lo, hi, r) = (inset, 24.0 - inset, radius - inset);
+        let cx = x.clamp(lo + r, hi - r);
+        let cy = y.clamp(lo + r, hi - r);
+        (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+            && (lo..=hi).contains(&x)
+            && (lo..=hi).contains(&y)
+    };
+    let near_segment = |x: f32, y: f32, a: (f32, f32), b: (f32, f32), w: f32| {
+        let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+        let t = (((x - a.0) * dx + (y - a.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        let (px, py) = (a.0 + t * dx - x, a.1 + t * dy - y);
+        px * px + py * py <= (w / 2.0).powi(2)
+    };
+    let brackets = [
+        [(8.0, 5.5), (5.5, 5.5), (5.5, 18.5), (8.0, 18.5)],
+        [(16.0, 5.5), (18.5, 5.5), (18.5, 18.5), (16.0, 18.5)],
+    ];
+    let in_trim = |x: f32, y: f32| {
+        brackets
+            .iter()
+            .any(|b| b.windows(2).any(|s| near_segment(x, y, s[0], s[1], 2.2)))
+    };
+    let in_play = |x: f32, y: f32| {
+        let tri = [(10.0, 8.5), (15.0, 12.0), (10.0, 15.5)];
+        let side = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0);
+        let s = [
+            side(tri[0], tri[1]),
+            side(tri[1], tri[2]),
+            side(tri[2], tri[0]),
+        ];
+        s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0)
+    };
+
+    const SS: u32 = 4;
+    let border_w = 24.0 / size as f32 * 1.0f32.max(size as f32 / 32.0);
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..size {
+        for px in 0..size {
+            let (mut acc, mut cover) = ([0.0f32; 3], 0.0f32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) * 24.0 / size as f32;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) * 24.0 / size as f32;
+                    if !in_rounded(x, y, 0.0) {
+                        continue;
+                    }
+                    let c = if in_play(x, y) {
+                        Color32::WHITE
+                    } else if in_trim(x, y) {
+                        TRIM
+                    } else if !in_rounded(x, y, border_w) {
+                        BORDER
+                    } else {
+                        RAISED
+                    };
+                    acc[0] += c.r() as f32;
+                    acc[1] += c.g() as f32;
+                    acc[2] += c.b() as f32;
+                    cover += 1.0;
+                }
+            }
+            let n = (SS * SS) as f32;
+            if cover == 0.0 {
+                rgba.extend([0, 0, 0, 0]);
+            } else {
+                // Unmultiplied: average colour of the covered samples.
+                rgba.extend(acc.map(|v| (v / cover).round() as u8));
+                rgba.push((cover / n * 255.0).round() as u8);
+            }
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: size,
+        height: size,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn window_icon_is_the_logo() {
+        let icon = super::window_icon(64);
+        assert_eq!(
+            (icon.width, icon.height, icon.rgba.len()),
+            (64, 64, 64 * 64 * 4)
+        );
+        let px = |x: usize, y: usize| &icon.rgba[(y * 64 + x) * 4..][..4];
+        // Rounded corners are transparent, the middle is the white play mark,
+        // and the brackets are amber.
+        assert_eq!(px(0, 0)[3], 0);
+        assert_eq!(px(30, 32), [255, 255, 255, 255]);
+        assert_eq!(px(15, 32), [0xf5, 0xb8, 0x3d, 255]);
+    }
+}

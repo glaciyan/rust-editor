@@ -34,7 +34,8 @@ fn main() -> eframe::Result<()> {
             .with_app_id("cutline")
             .with_inner_size([1160.0, 780.0])
             .with_min_inner_size([720.0, 540.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(std::sync::Arc::new(icons::window_icon(64))),
         event_loop_builder: x11_for_drag_and_drop(),
         ..Default::default()
     };
