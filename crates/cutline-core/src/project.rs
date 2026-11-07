@@ -338,6 +338,34 @@ impl Project {
         Some(r)
     }
 
+    /// `S`: split the part under `t` (clip-local) in two at `t`, both
+    /// halves kept as they were. Selects the second half, so Delete then
+    /// cuts from the playhead to the part's old end. `None` when `t` isn't
+    /// inside a part or either half would be shorter than [`MIN_PART`].
+    pub fn split_part(&mut self, clip: u64, t: Timestamp) -> Option<PartRef> {
+        let pid = self.next_id + 1;
+        let c = self.clip_mut(clip)?;
+        let t = c.snap(t);
+        let idx = c
+            .parts
+            .iter()
+            .position(|p| t - p.start >= MIN_PART && p.end - t >= MIN_PART && p.contains(t))?;
+        let end = c.parts[idx].end;
+        c.parts[idx].end = t;
+        c.parts.insert(
+            idx + 1,
+            Part {
+                id: pid,
+                start: t,
+                end,
+            },
+        );
+        self.next_id = pid;
+        let r = PartRef { clip, part: pid };
+        self.selected = Some(r);
+        Some(r)
+    }
+
     pub fn remove_part(&mut self, r: PartRef) {
         if let Some(c) = self.clip_mut(r.clip) {
             c.parts.retain(|p| p.id != r.part);
@@ -567,6 +595,27 @@ mod tests {
             (segs[0].clip, segs[0].start, segs[0].end),
             (id, ts(0.0), ts(100.0))
         );
+    }
+
+    #[test]
+    fn split_keeps_everything_and_selects_the_second_half() {
+        let (mut p, id) = one_clip();
+        let first = p.selected.unwrap();
+        let second = p.split_part(id, ts(40.0)).unwrap();
+        assert_eq!(p.selected, Some(second));
+        let c = p.clip(id).unwrap();
+        assert_eq!(
+            c.parts.iter().map(|q| (q.start, q.end)).collect::<Vec<_>>(),
+            vec![(ts(0.0), ts(40.0)), (ts(40.0), ts(100.0))]
+        );
+        // Nothing changes in the export until a half is deleted.
+        let total: f64 = p.segments().iter().map(|s| s.len().secs()).sum();
+        assert!((total - 100.0).abs() < 1e-6);
+        p.remove_part(second);
+        assert_eq!(p.part(first).map(|q| q.end), Some(ts(40.0)));
+        // Outside any part, or too close to an edge: no split.
+        assert!(p.split_part(id, ts(70.0)).is_none());
+        assert!(p.split_part(id, ts(39.99)).is_none());
     }
 
     #[test]
