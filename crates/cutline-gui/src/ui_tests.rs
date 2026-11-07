@@ -652,3 +652,82 @@ fn unpicked_segments_are_muted() {
     assert_eq!(color_of("MP4"), Some(theme::TEXT));
     assert_eq!(color_of("MKV"), Some(theme::MUTED));
 }
+
+/// Where each piece of text in the last frame was drawn.
+fn drawn_text_rects(h: &Harness<'_, CutlineApp>) -> Vec<(String, egui::Rect)> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => out.push((t.galley.job.text.clone(), t.visual_bounding_rect())),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for s in &h.output().shapes {
+        walk(&s.shape, &mut out);
+    }
+    out
+}
+
+/// The text-field wells drawn in the last frame: dark fill with a border.
+fn drawn_field_boxes(h: &Harness<'_, CutlineApp>) -> Vec<egui::Rect> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(r)
+                if r.fill == theme::BG
+                    && (r.stroke.color == theme::BORDER
+                        || r.stroke.color == theme::FIELD_FOCUS) =>
+            {
+                out.push(r.rect)
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for s in &h.output().shapes {
+        walk(&s.shape, &mut out);
+    }
+    out
+}
+
+/// The text in the box labelled `label` sits in the middle of the box as
+/// drawn (not the box egui reports, which can be taller than what's seen).
+fn assert_text_centred_in(h: &Harness<'_, CutlineApp>, label: &str) {
+    let field = h.get_by_role_and_label(Role::TextInput, label);
+    let value = field.value().expect("a text box has a value");
+    let reported = field.rect();
+    let (_, text) = drawn_text_rects(h)
+        .into_iter()
+        .find(|(t, r)| *t == value && reported.intersects(*r))
+        .unwrap_or_else(|| panic!("{value:?} wasn't drawn in the {label} box"));
+    let well = drawn_field_boxes(h)
+        .into_iter()
+        .filter(|b| b.intersects(text))
+        .min_by(|a, b| a.area().total_cmp(&b.area()))
+        .unwrap_or_else(|| panic!("no box drawn around the {label} text"));
+    let off = text.center().y - well.center().y;
+    assert!(
+        off.abs() <= 1.0,
+        "{label}: text is {off:+.1} px off the middle of its {:.0} px box",
+        well.height()
+    );
+    assert!(
+        well.contains_rect(reported.shrink(0.5)),
+        "{label}: the field reports {reported:?} but is drawn at {well:?}"
+    );
+}
+
+#[test]
+fn text_sits_in_the_middle_of_its_box() {
+    let mut h = editor();
+    open_export(&mut h);
+    // The short box inside the Fit to size row, and a full-height one.
+    assert_text_centred_in(&h, "Target size in MB");
+    assert_text_centred_in(&h, "Name");
+    assert_text_centred_in(&h, "Save to");
+    click(&mut h, "New profile…");
+    type_into(&mut h, "Name", "Discord");
+    assert_text_centred_in(&h, "Name");
+    assert_text_centred_in(&h, "Quality, 0 best to 51 worst");
+}

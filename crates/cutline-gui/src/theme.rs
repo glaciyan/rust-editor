@@ -640,6 +640,9 @@ impl Widget for Field<'_> {
                 .max_rect(inner)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        // A single-line edit is at least `interact_size` tall; a shorter
+        // box would get a taller edit, its text centred below the box's middle.
+        child.spacing_mut().interact_size.y = h;
         let mut edit = egui::TextEdit::singleline(self.text)
             .id(id)
             .frame(egui::Frame::NONE)
