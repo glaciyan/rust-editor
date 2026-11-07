@@ -2193,6 +2193,11 @@ impl CutlineApp {
     fn timeline_action(&mut self, action: TimelineAction) {
         match action {
             TimelineAction::None => {}
+            // A held drag reports its position on every repaint, and each seek
+            // wakes the UI again: re-seeking to where the preview already is
+            // would keep mpv restarting the same seek while the pointer rests.
+            TimelineAction::Seek(c, t) | TimelineAction::Dragging(c, t)
+                if self.playhead == Some((c, t)) && !self.playing() => {}
             TimelineAction::Seek(c, t) => self.seek(c, t),
             TimelineAction::DragStart(c, t) => {
                 if self.resume_after_drag.is_none() {

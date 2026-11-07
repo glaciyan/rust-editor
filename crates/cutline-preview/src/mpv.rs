@@ -150,10 +150,17 @@ impl MpvPlayer {
             let opt =
                 |k: &str, v: &str| (api.set_option_string)(handle, cs(k).as_ptr(), cs(v).as_ptr());
             opt("vo", "libmpv");
-            opt("hwdec", "auto-safe");
+            // Tuned for scrubbing (see `examples/scrub.rs`). Frames are copied
+            // to the CPU for the software renderer anyway, and software decoding
+            // restarts after a seek far sooner than hwdec with copy-back.
+            opt("hwdec", "no");
             opt("keep-open", "yes");
             opt("hr-seek", "yes");
-            opt("hr-seek-framedrop", "no");
+            // Skip decoding frames nothing references on the way to a seek target.
+            opt("hr-seek-framedrop", "yes");
+            // Show the first frame after a seek instead of first buffering
+            // several: ~200 ms off every seek and every file open.
+            opt("video-latency-hacks", "yes");
             opt("audio-display", "no");
             opt("osc", "no");
             opt("input-default-bindings", "no");
@@ -306,6 +313,7 @@ impl MpvPlayer {
                     _ => {}
                 }
             }
+
             if !self.have_file {
                 return None;
             }
@@ -359,7 +367,8 @@ impl MpvPlayer {
             if (self.api.render_render)(self.render, params.as_mut_ptr()) < 0 {
                 return None;
             }
-            let mut rgba = self.buf.clone();
+            // Hand the buffer over rather than copy it; the next frame gets a new one.
+            let mut rgba = std::mem::take(&mut self.buf);
             // Force every alpha byte opaque (RGBA, so bytes 3, 7, 11, …).
             for a in rgba.iter_mut().skip(3).step_by(4) {
                 *a = 255;
