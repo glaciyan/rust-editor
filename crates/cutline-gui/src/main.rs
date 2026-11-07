@@ -35,6 +35,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1160.0, 780.0])
             .with_min_inner_size([720.0, 540.0])
             .with_drag_and_drop(true),
+        event_loop_builder: x11_for_drag_and_drop(),
         ..Default::default()
     };
     eframe::run_native(
@@ -42,4 +43,26 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::CutlineApp::new(cc, args)))),
     )
+}
+
+/// winit 0.30 only delivers dropped files on X11; its Wayland backend has no
+/// drag-and-drop. When an X server is reachable (XWayland on every mainstream
+/// desktop), run through it so dropping videos onto the window works.
+/// `CUTLINE_WAYLAND=1` opts back into native Wayland.
+#[cfg(target_os = "linux")]
+fn x11_for_drag_and_drop() -> Option<eframe::EventLoopBuilderHook> {
+    let has_x = std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
+    let want_wayland = std::env::var_os("CUTLINE_WAYLAND").is_some_and(|v| v != "0");
+    if !has_x || want_wayland {
+        return None;
+    }
+    Some(Box::new(|builder| {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn x11_for_drag_and_drop() -> Option<eframe::EventLoopBuilderHook> {
+    None
 }
