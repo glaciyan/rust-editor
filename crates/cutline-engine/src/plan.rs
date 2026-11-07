@@ -826,7 +826,21 @@ impl<'a> Planner<'a> {
                 .map(|v| v.codec == "hevc")
                 .unwrap_or(false)
             {
-                mux = mux.args(["-tag:v", "hvc1"]);
+                // `hvc1` keeps parameter sets only in the sample entry, and
+                // ffmpeg 9 strips in-band ones when muxing it. A stream joined
+                // from pieces with different parameter sets (a re-encoded
+                // edge, or another file) then decodes the copied pieces with
+                // the wrong ones. `hev1` keeps them in-band. Apple players
+                // want `hvc1`, so use it whenever there's one set throughout.
+                let one_source = group
+                    .iter()
+                    .all(|&si| req.segments[si].path == req.segments[group[0]].path);
+                let tag = if any_smart || !one_source {
+                    "hev1"
+                } else {
+                    "hvc1"
+                };
+                mux = mux.args(["-tag:v", tag]);
             }
             mux = mux.args(["-movflags", "+faststart"]);
         }
@@ -1589,9 +1603,38 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|c| c.contains("-c:v copy") && c.contains("noise=drop=")));
-        assert!(cmds.last().unwrap().contains("-tag:v hvc1"));
+        // Re-encoded edges bring their own parameter sets: keep them in-band.
+        assert!(cmds.last().unwrap().contains("-tag:v hev1"));
         assert!(o.steps.iter().any(|s| matches!(s, Step::Verify { .. })));
         assert!((o.duration - 10.0).abs() < 0.05, "{}", o.duration);
+    }
+
+    #[test]
+    fn pure_copy_keeps_the_apple_friendly_tag() {
+        // Closed GOPs, keyframes every 2 s, parts cut on keyframes of one
+        // file: nothing re-encoded, one set of parameter sets, so `hvc1`.
+        let closed: Vec<Packet> = (0..600).map(|i| pk(i as f64 / 30.0, i % 60 == 0)).collect();
+        let r = req(
+            Profile::original(),
+            vec![("/v/a.mp4", 2.0, 8.0), ("/v/a.mp4", 10.0, 14.0)],
+        );
+        let facts = Facts {
+            sources: [("/v/a.mp4".into(), info("/v/a.mp4", "hevc", 1280, 720))].into(),
+            packets: vec![closed.clone(), closed],
+        };
+        let tmp = PathBuf::from("/out/.cutline-1");
+        let plan = Planner {
+            req: &r,
+            facts: &facts,
+            caps: &caps(),
+            tmp: &tmp,
+            pass_log_dir: &tmp,
+        }
+        .plan()
+        .unwrap();
+        let o = &plan.outputs[0];
+        assert!(!o.smart, "{:#?}", all_args(o));
+        assert!(all_args(o).last().unwrap().contains("-tag:v hvc1"));
     }
 
     #[test]
