@@ -29,7 +29,7 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(tmp, path)
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub project: Project,
     /// Playhead, as (clip id, seconds into that clip).
@@ -38,6 +38,27 @@ pub struct Session {
     /// Last folder exported to.
     #[serde(default)]
     pub last_export_dir: Option<PathBuf>,
+    /// Preview volume, 0–100.
+    #[serde(default = "default_volume")]
+    pub volume: f64,
+    #[serde(default)]
+    pub muted: bool,
+}
+
+fn default_volume() -> f64 {
+    100.0
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            project: Project::default(),
+            playhead: None,
+            last_export_dir: None,
+            volume: default_volume(),
+            muted: false,
+        }
+    }
 }
 
 pub fn session_path() -> PathBuf {

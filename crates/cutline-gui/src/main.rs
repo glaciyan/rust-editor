@@ -3,6 +3,7 @@
 mod app;
 mod dialogs;
 mod export;
+mod icons;
 mod theme;
 mod timeline;
 
@@ -31,8 +32,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cutline")
             .with_app_id("cutline")
-            .with_inner_size([960.0, 760.0])
-            .with_min_inner_size([640.0, 520.0])
+            .with_inner_size([1160.0, 780.0])
+            .with_min_inner_size([720.0, 540.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };

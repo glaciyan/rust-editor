@@ -2,13 +2,15 @@
 //! marked parts outlined with a handle at each end, and the playhead.
 
 use crate::app::CutlineApp;
-use crate::theme::{self, ACCENT, INK, MUTED};
+use crate::theme::{self, FAINT, MUTED, TEXT, TRIM};
 use cutline_core::{format, Handle, PartMode, PartRef, Timestamp};
 use eframe::egui::{self, Color32, CursorIcon, Pos2, Rect, Sense, Stroke};
 
-const STRIP_H: f32 = 48.0;
-const HANDLE_W: f32 = 8.0;
-const GRAB: f32 = 9.0;
+const RULER_H: f32 = 20.0;
+const STRIP_H: f32 = 56.0;
+const LABELS_H: f32 = 18.0;
+const HANDLE_W: f32 = 10.0;
+const GRAB: f32 = 10.0;
 
 #[derive(Default)]
 pub struct TimelineView {
@@ -36,6 +38,7 @@ pub enum TimelineAction {
 }
 
 struct Geometry {
+    ruler: Rect,
     strip: Rect,
     total: f64,
 }
@@ -49,37 +52,125 @@ impl Geometry {
     }
 }
 
+/// Colour of the part outlines: amber for parts you keep, red for parts you cut.
+fn part_color(mode: PartMode) -> Color32 {
+    match mode {
+        PartMode::Keep => TRIM,
+        PartMode::Remove => theme::DANGER,
+    }
+}
+
 pub fn show(ui: &mut egui::Ui, app: &mut CutlineApp) -> TimelineAction {
     let mut action = TimelineAction::None;
     let frame = egui::Frame::new()
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::symmetric(13, 14));
+        .fill(theme::BG)
+        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+        .corner_radius(10)
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 6,
+            bottom: 4,
+        });
     frame.show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
         let (outer, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), STRIP_H),
+            egui::vec2(ui.available_width(), RULER_H + STRIP_H + 8.0),
             Sense::click_and_drag(),
         );
+        let ruler = Rect::from_min_size(outer.min, egui::vec2(outer.width(), RULER_H));
+        let strip = Rect::from_min_size(
+            egui::pos2(outer.left(), ruler.bottom() + 4.0),
+            egui::vec2(outer.width(), STRIP_H),
+        );
         let geo = Geometry {
-            strip: outer,
+            ruler,
+            strip,
             total: app.project.total_duration().secs(),
         };
         if app.project.is_empty() || geo.total <= 0.0 {
-            ui.painter().rect_filled(outer, 3, theme::WELL);
-            ui.painter().text(
-                outer.center(),
-                egui::Align2::CENTER_CENTER,
-                "Your timeline",
-                egui::FontId::proportional(13.0),
-                MUTED,
+            draw_ruler(ui, &geo, false);
+            let p = ui.painter();
+            p.rect(
+                strip,
+                6,
+                theme::PANEL,
+                Stroke::new(1.0, theme::HAIRLINE),
+                egui::StrokeKind::Inside,
             );
+            p.text(
+                strip.center(),
+                egui::Align2::CENTER_CENTER,
+                "Your videos appear here",
+                egui::FontId::proportional(12.5),
+                FAINT,
+            );
+            ui.allocate_exact_size(egui::vec2(strip.width(), LABELS_H), Sense::hover());
             return;
         }
+        draw_ruler(ui, &geo, true);
         draw(ui, app, &geo);
         action = interact(ui, app, &geo, &resp);
+        hover_line(ui, app, &geo, &resp);
         labels(ui, app, &geo);
     });
     action
+}
+
+/// Pick a tick step so labels sit at least `min_px` apart.
+fn tick_step(total: f64, width: f32, min_px: f32) -> f64 {
+    const STEPS: [f64; 17] = [
+        0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0,
+        3600.0, 7200.0,
+    ];
+    let px_per_s = width as f64 / total.max(1e-6);
+    STEPS
+        .iter()
+        .copied()
+        .find(|s| s * px_per_s >= min_px as f64)
+        .unwrap_or(7200.0)
+}
+
+fn draw_ruler(ui: &egui::Ui, geo: &Geometry, labelled: bool) {
+    let p = ui.painter();
+    let r = geo.ruler;
+    p.hline(r.x_range(), r.bottom(), Stroke::new(1.0, theme::HAIRLINE));
+    if !labelled {
+        return;
+    }
+    let step = tick_step(geo.total, r.width(), 84.0);
+    let minor = step / 5.0;
+    let n_minor = (geo.total / minor).floor() as usize;
+    for i in 0..=n_minor {
+        let t = i as f64 * minor;
+        let x = geo.x(t);
+        let major = i % 5 == 0;
+        let h = if major { 8.0 } else { 4.0 };
+        p.vline(
+            x,
+            r.bottom() - h..=r.bottom(),
+            Stroke::new(
+                1.0,
+                if major {
+                    theme::BORDER_STRONG
+                } else {
+                    theme::BORDER
+                },
+            ),
+        );
+        if major {
+            let text = if step < 1.0 {
+                format::clock_precise(t)
+            } else {
+                format::clock(t)
+            };
+            let g = p.layout_no_wrap(text, egui::FontId::monospace(10.5), FAINT);
+            let gx = (x + 4.0).min(r.right() - g.size().x);
+            if gx > x - 2.0 {
+                p.galley(egui::pos2(gx, r.top() + 1.0), g, FAINT);
+            }
+        }
+    }
 }
 
 fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
@@ -101,7 +192,7 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
         })
         .collect();
 
-    // Thumbnails.
+    // Thumbnails, one rounded film strip per video.
     for (id, off, dur, name) in &clips {
         let x0 = geo.x(*off) + if multi { 1.5 } else { 0.0 };
         let x1 = geo.x(off + dur) - if multi { 1.5 } else { 0.0 };
@@ -118,62 +209,61 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
         let count = (((rect.width() / tile_w).ceil() as usize).div_ceil(4) * 4).clamp(4, 200);
         app.want_thumbs(*id, count, (STRIP_H * ppp) as usize);
         let w = rect.width() / count as f32;
+        let clip_painter = painter.with_clip_rect(rect);
+        clip_painter.rect_filled(rect, 6, theme::RAISED);
         for j in 0..count {
             let r = Rect::from_x_y_ranges(
                 rect.left() + j as f32 * w..=rect.left() + (j + 1) as f32 * w,
                 strip.y_range(),
             );
-            let r = r.shrink2(egui::vec2(0.5, 0.0));
-            match app.thumb_tex.get(&(*id, count, j)) {
-                Some(tex) => {
-                    // Crop the picture to the tile's shape instead of squashing it.
-                    let ta = tex.aspect_ratio();
-                    let ra = r.width() / r.height();
-                    let uv = if ra < ta {
-                        let k = ra / ta;
-                        Rect::from_min_max(
-                            egui::pos2(0.5 - k / 2.0, 0.0),
-                            egui::pos2(0.5 + k / 2.0, 1.0),
-                        )
-                    } else {
-                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
-                    };
-                    painter.image(tex.id(), r, uv, Color32::WHITE);
-                }
-                None => {
-                    painter.rect_filled(r, 3, theme::WELL);
-                    painter.rect_stroke(
-                        r,
-                        3,
-                        Stroke::new(1.0, theme::HAIRLINE),
-                        egui::StrokeKind::Inside,
-                    );
-                }
+            if let Some(tex) = app.thumb_tex.get(&(*id, count, j)) {
+                // Crop the picture to the tile's shape instead of squashing it.
+                let ta = tex.aspect_ratio();
+                let ra = r.width() / r.height();
+                let uv = if ra < ta {
+                    let k = ra / ta;
+                    Rect::from_min_max(
+                        egui::pos2(0.5 - k / 2.0, 0.0),
+                        egui::pos2(0.5 + k / 2.0, 1.0),
+                    )
+                } else {
+                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+                };
+                clip_painter.image(tex.id(), r, uv, Color32::WHITE);
+            } else {
+                clip_painter.vline(r.right(), r.y_range(), Stroke::new(1.0, theme::HAIRLINE));
             }
         }
+        // Round the strip's corners by painting the background over them.
+        painter.rect_stroke(
+            rect.expand(3.0),
+            9,
+            Stroke::new(6.0, theme::BG),
+            egui::StrokeKind::Inside,
+        );
         if multi && rect.width() > 60.0 {
             let galley = painter.layout_no_wrap(
                 name.clone(),
-                egui::FontId::proportional(11.0),
+                egui::FontId::new(11.0, theme::semibold_family()),
                 Color32::WHITE,
             );
-            let w = galley.size().x.min(rect.width() - 8.0);
+            let w = galley.size().x.min(rect.width() - 16.0);
             let bg = Rect::from_min_size(
-                rect.left_top() + egui::vec2(4.0, 4.0),
-                egui::vec2(w + 8.0, 16.0),
+                rect.left_top() + egui::vec2(5.0, 5.0),
+                egui::vec2(w + 10.0, 17.0),
             );
             painter
                 .with_clip_rect(rect)
-                .rect_filled(bg, 3, Color32::from_black_alpha(150));
+                .rect_filled(bg, 4, Color32::from_black_alpha(170));
             painter.with_clip_rect(bg.shrink(1.0)).galley(
-                bg.min + egui::vec2(4.0, 1.5),
+                bg.min + egui::vec2(5.0, 1.5),
                 galley,
                 Color32::WHITE,
             );
         }
     }
 
-    // Shade what will be cut out.
+    // Shade and hatch what will be cut out.
     let mode = app.project.mode;
     for c in &app.project.clips {
         let off = app.project.clip_offset(c.id).secs();
@@ -182,6 +272,20 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
             if b - a > 1e-6 {
                 let r = Rect::from_x_y_ranges(geo.x(off + a)..=geo.x(off + b), strip.y_range());
                 painter.rect_filled(r, 0, theme::SHADE);
+                let hp = painter.with_clip_rect(r.intersect(painter.clip_rect()));
+                let mut x = r.left() - r.height();
+                let x0 = (x / 9.0).floor() * 9.0;
+                x = x0;
+                while x < r.right() {
+                    hp.line_segment(
+                        [
+                            egui::pos2(x, r.bottom()),
+                            egui::pos2(x + r.height(), r.top()),
+                        ],
+                        Stroke::new(1.0, Color32::from_white_alpha(9)),
+                    );
+                    x += 9.0;
+                }
             }
         };
         for (a, b) in c.kept_ranges(mode) {
@@ -191,8 +295,9 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
         shade(cur, c.duration.secs());
     }
 
-    // Outline the marked parts and draw their handles.
+    // Outline the marked parts and draw their handles as trim brackets.
     let selected = app.project.selected;
+    let color = part_color(mode);
     for c in &app.project.clips {
         let off = app.project.clip_offset(c.id).secs();
         for p in &c.parts {
@@ -203,36 +308,56 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
                     clip: c.id,
                     part: p.id,
                 });
+            let col = if is_sel {
+                color
+            } else {
+                color.linear_multiply(0.7)
+            };
             let outline = Rect::from_x_y_ranges(xa..=xb, strip.top() - 2.0..=strip.bottom() + 2.0);
             if is_sel {
-                painter.rect_filled(
-                    outline,
-                    3,
-                    Color32::from_rgba_unmultiplied(47, 111, 214, 28),
-                );
+                painter.rect_filled(outline, 4, theme::TRIM_SOFT);
             }
             painter.rect_stroke(
                 outline,
-                3,
-                Stroke::new(2.0, ACCENT),
+                4,
+                Stroke::new(if is_sel { 2.5 } else { 2.0 }, col),
                 egui::StrokeKind::Inside,
             );
-            for x in [xa, xb] {
-                let h = Rect::from_center_size(
-                    egui::pos2(x, strip.center().y),
-                    egui::vec2(HANDLE_W, STRIP_H + 12.0),
+            for (x, start) in [(xa, true), (xb, false)] {
+                let h = Rect::from_x_y_ranges(
+                    if start {
+                        x..=x + HANDLE_W
+                    } else {
+                        x - HANDLE_W..=x
+                    },
+                    strip.top() - 2.0..=strip.bottom() + 2.0,
                 );
-                painter.rect_filled(h, 3, ACCENT);
-                if is_sel {
-                    for dy in [-4.0, 0.0, 4.0] {
-                        painter.line_segment(
-                            [
-                                egui::pos2(x - 2.0, h.center().y + dy),
-                                egui::pos2(x + 2.0, h.center().y + dy),
-                            ],
-                            Stroke::new(1.0, Color32::from_white_alpha(200)),
-                        );
+                let cr = if start {
+                    egui::CornerRadius {
+                        nw: 4,
+                        sw: 4,
+                        ne: 0,
+                        se: 0,
                     }
+                } else {
+                    egui::CornerRadius {
+                        nw: 0,
+                        sw: 0,
+                        ne: 4,
+                        se: 4,
+                    }
+                };
+                painter.rect_filled(h, cr, col);
+                // Grip lines.
+                for dx in [-1.5, 1.5] {
+                    painter.vline(
+                        h.center().x + dx,
+                        h.center().y - 7.0..=h.center().y + 7.0,
+                        Stroke::new(
+                            1.0,
+                            Color32::from_black_alpha(if is_sel { 150 } else { 110 }),
+                        ),
+                    );
                 }
             }
         }
@@ -241,23 +366,43 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
     // Playhead.
     if let Some((clip, t)) = app.playhead {
         let x = geo.x(app.project.clip_offset(clip).secs() + t.secs());
-        painter.line_segment(
-            [
-                egui::pos2(x, strip.top() - 8.0),
-                egui::pos2(x, strip.bottom() + 8.0),
-            ],
-            Stroke::new(2.0, INK),
+        let top = geo.ruler.top() + 2.0;
+        painter.vline(
+            x,
+            top + 10.0..=strip.bottom() + 4.0,
+            Stroke::new(2.0, theme::PLAYHEAD),
         );
         painter.add(egui::Shape::convex_polygon(
             vec![
-                egui::pos2(x - 5.0, strip.top() - 12.0),
-                egui::pos2(x + 5.0, strip.top() - 12.0),
-                egui::pos2(x, strip.top() - 6.0),
+                egui::pos2(x - 6.0, top),
+                egui::pos2(x + 6.0, top),
+                egui::pos2(x + 6.0, top + 8.0),
+                egui::pos2(x, top + 14.0),
+                egui::pos2(x - 6.0, top + 8.0),
             ],
-            INK,
+            theme::PLAYHEAD,
             Stroke::NONE,
         ));
     }
+}
+
+/// A faint line under the pointer, so you can see where a click will land.
+fn hover_line(ui: &egui::Ui, app: &CutlineApp, geo: &Geometry, resp: &egui::Response) {
+    if app.timeline.drag.is_some() || !resp.hovered() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    if handle_at(app, geo, pos).is_some() {
+        return;
+    }
+    let x = pos.x.clamp(geo.strip.left(), geo.strip.right());
+    ui.painter().vline(
+        x,
+        geo.ruler.top()..=geo.strip.bottom(),
+        Stroke::new(1.0, Color32::from_white_alpha(70)),
+    );
 }
 
 /// Handle nearest to the pointer, if close enough to grab.
@@ -468,16 +613,16 @@ fn tooltip(ui: &egui::Ui, geo: &Geometry, x: f32, text: &str) {
     let galley = painter.layout_no_wrap(
         text.to_string(),
         egui::FontId::monospace(12.0),
-        Color32::WHITE,
+        theme::VIEWER,
     );
-    let size = galley.size() + egui::vec2(12.0, 6.0);
-    let r = Rect::from_center_size(egui::pos2(x, geo.strip.top() - 26.0), size);
-    painter.rect_filled(r, 4, INK);
-    painter.galley(r.min + egui::vec2(6.0, 3.0), galley, Color32::WHITE);
+    let size = galley.size() + egui::vec2(14.0, 8.0);
+    let r = Rect::from_center_size(egui::pos2(x, geo.ruler.top() - 12.0), size);
+    painter.rect_filled(r, 5, TRIM);
+    painter.galley(r.min + egui::vec2(7.0, 4.0), galley, theme::VIEWER);
 }
 
 fn labels(ui: &mut egui::Ui, app: &CutlineApp, geo: &Geometry) {
-    let (row, _) = ui.allocate_exact_size(egui::vec2(geo.strip.width(), 16.0), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(egui::vec2(geo.strip.width(), LABELS_H), Sense::hover());
     let painter = ui.painter();
     let mut last_right = f32::MIN;
     let mut n = 0;
@@ -485,18 +630,28 @@ fn labels(ui: &mut egui::Ui, app: &CutlineApp, geo: &Geometry) {
         let off = app.project.clip_offset(c.id).secs();
         for p in &c.parts {
             n += 1;
+            let is_sel = app.project.selected
+                == Some(PartRef {
+                    clip: c.id,
+                    part: p.id,
+                });
             let mid = geo.x(off + (p.start.secs() + p.end.secs()) / 2.0);
             let text = match app.project.mode {
                 PartMode::Keep => format!("Part {n} · {}", format::length(p.len().secs())),
                 PartMode::Remove => format!("Cut {n} · {}", format::length(p.len().secs())),
             };
-            let galley = painter.layout_no_wrap(text, egui::FontId::proportional(12.0), INK);
+            let (font, color) = if is_sel {
+                (egui::FontId::new(11.5, theme::semibold_family()), TEXT)
+            } else {
+                (egui::FontId::proportional(11.5), MUTED)
+            };
+            let galley = painter.layout_no_wrap(text, font, color);
             let w = galley.size().x;
             let left = (mid - w / 2.0).clamp(row.left(), row.right() - w);
             if left < last_right + 8.0 {
                 continue;
             }
-            painter.galley(egui::pos2(left, row.top()), galley, INK);
+            painter.galley(egui::pos2(left, row.top() + 3.0), galley, color);
             last_right = left + w;
         }
     }

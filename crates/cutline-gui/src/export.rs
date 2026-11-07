@@ -2,7 +2,8 @@
 //! minutes are shown; codecs and the like live in Advanced….
 
 use crate::app::CutlineApp;
-use crate::theme::{self, ACCENT, ACCENT_BG, BORDER, INK, MUTED};
+use crate::icons::Icon;
+use crate::theme::{self, ACCENT, ACCENT_SOFT, BORDER, MUTED};
 use cutline_core::{format, Profile, Quality, RateControl};
 use cutline_engine::estimate::{self, calibration_key, FitEstimate};
 use cutline_engine::request::{default_name, free_name, ExportRequest};
@@ -210,29 +211,32 @@ impl ExportDialog {
         let mut save = false;
         let mut save_mode: Option<bool> = None; // Some(true) = replace, Some(false) = keep both
 
-        let modal = egui::Modal::new(egui::Id::unique("export")).frame(
-            egui::Frame::new()
-                .fill(theme::SURFACE)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(10)
-                .inner_margin(0),
-        );
+        let modal = egui::Modal::new(egui::Id::unique("export")).frame(theme::dialog_frame());
         let resp = modal.show(ctx, |ui| {
             ui.set_width(width);
             egui::Frame::new()
                 .inner_margin(egui::Margin {
-                    left: 16,
-                    right: 16,
-                    top: 20,
+                    left: 20,
+                    right: 20,
+                    top: 18,
                     bottom: 0,
                 })
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Export").size(17.0).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (r, _) =
+                            ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                        ui.painter().rect_filled(r, 8, ACCENT_SOFT);
+                        Icon::Export.paint(
+                            ui.painter(),
+                            egui::Rect::from_center_size(r.center(), egui::vec2(16.0, 16.0)),
+                            theme::ACCENT_HOVER,
+                        );
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(theme::strong("Export").size(16.0));
                             let n = segments.len();
                             ui.label(theme::small(format!(
-                                "{} part{} · {}",
+                                "{} part{} · {} long",
                                 n,
                                 if n == 1 { "" } else { "s" },
                                 format::length(total)
@@ -240,7 +244,9 @@ impl ExportDialog {
                         });
                     });
                 });
-            egui::Frame::new().inner_margin(16).show(ui, |ui| {
+            egui::Frame::new().inner_margin(20).show(ui, |ui| {
+                ui.label(theme::caption("Quality"));
+                ui.add_space(2.0);
                 ui.columns(3, |cols| {
                     // Original quality
                     self.choice = card(
@@ -252,7 +258,7 @@ impl ExportDialog {
                             ui.radio_value(
                                 &mut c,
                                 Choice::Original,
-                                egui::RichText::new("Original quality").strong(),
+                                theme::strong("Original quality"),
                             );
                             ui.label(
                                 egui::RichText::new("Same quality as your video. Fastest.")
@@ -262,7 +268,7 @@ impl ExportDialog {
                                 ui.label(theme::small(n.clone()));
                             }
                             bottom(ui, |ui| {
-                                ui.label(format::about_size(orig.bytes));
+                                ui.label(theme::strong(format::about_size(orig.bytes)));
                                 ui.label(theme::small(format::ready_in(orig.seconds)));
                             });
                             c
@@ -276,11 +282,7 @@ impl ExportDialog {
                         Choice::Fit,
                         |ui| {
                             let mut c = self.choice;
-                            ui.radio_value(
-                                &mut c,
-                                Choice::Fit,
-                                egui::RichText::new("Fit to size").strong(),
-                            );
+                            ui.radio_value(&mut c, Choice::Fit, theme::strong("Fit to size"));
                             ui.horizontal(|ui| {
                                 let r = ui.add(
                                     egui::TextEdit::singleline(&mut self.fit_text)
@@ -333,7 +335,7 @@ impl ExportDialog {
                                     ui.label(
                                         egui::RichText::new(format::ready_in(e.seconds))
                                             .size(12.0)
-                                            .color(egui::Color32::from_rgb(0x4f, 0x4e, 0x4a)),
+                                            .color(MUTED),
                                     );
                                 }
                             });
@@ -348,11 +350,7 @@ impl ExportDialog {
                         Choice::Preset,
                         |ui| {
                             let mut c = self.choice;
-                            ui.radio_value(
-                                &mut c,
-                                Choice::Preset,
-                                egui::RichText::new("Presets").strong(),
-                            );
+                            ui.radio_value(&mut c, Choice::Preset, theme::strong("Presets"));
                             let before = self.preset_id.clone();
                             let combo = egui::ComboBox::from_id_salt("preset")
                                 .width(ui.available_width())
@@ -371,7 +369,7 @@ impl ExportDialog {
                             }
                             ui.label(egui::RichText::new(preset.description.clone()).size(12.0));
                             bottom(ui, |ui| {
-                                ui.label(format::about_size(preset_est.bytes));
+                                ui.label(theme::strong(format::about_size(preset_est.bytes)));
                                 ui.label(theme::small(format::ready_in(preset_est.seconds)));
                             });
                             c
@@ -379,7 +377,9 @@ impl ExportDialog {
                     );
                 });
 
-                ui.add_space(12.0);
+                ui.add_space(16.0);
+                ui.label(theme::caption("Output"));
+                ui.add_space(2.0);
                 egui::Grid::new("export-fields")
                     .num_columns(2)
                     .spacing([16.0, 12.0])
@@ -401,7 +401,7 @@ impl ExportDialog {
                         ui.end_row();
                         ui.label(egui::RichText::new("Save to").color(MUTED));
                         ui.horizontal(|ui| {
-                            let w = ui.available_width() - 96.0;
+                            let w = ui.available_width() - 118.0;
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut self.folder)
@@ -412,7 +412,11 @@ impl ExportDialog {
                             {
                                 self.conflict = None;
                             }
-                            if ui.button("Choose…").clicked() && self.folder_rx.is_none() {
+                            if ui
+                                .add(theme::secondary("Choose…").icon(Icon::Folder).height(34.0))
+                                .clicked()
+                                && self.folder_rx.is_none()
+                            {
                                 let (tx, rx) = channel();
                                 let start = PathBuf::from(&self.folder);
                                 std::thread::spawn(move || {
@@ -457,7 +461,8 @@ impl ExportDialog {
                 if let Some(files) = &self.conflict {
                     ui.add_space(8.0);
                     egui::Frame::new()
-                        .fill(theme::WELL)
+                        .fill(theme::BG)
+                        .stroke(Stroke::new(1.0, theme::TRIM.linear_multiply(0.5)))
                         .corner_radius(8)
                         .inner_margin(12)
                         .show(ui, |ui| {
@@ -474,10 +479,10 @@ impl ExportDialog {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.button("Replace").clicked() {
+                                        if ui.add(theme::secondary("Replace")).clicked() {
                                             save_mode = Some(true);
                                         }
-                                        if ui.button("Keep both").clicked() {
+                                        if ui.add(theme::secondary("Keep both")).clicked() {
                                             save_mode = Some(false);
                                         }
                                     },
@@ -497,16 +502,19 @@ impl ExportDialog {
                 Stroke::new(1.0, theme::HAIRLINE),
             );
             egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(16, 8))
+                .fill(theme::BG)
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 14,
+                    se: 14,
+                })
+                .inner_margin(egui::Margin::symmetric(20, 12))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("Advanced…").size(13.0).color(MUTED),
-                                )
-                                .frame(false),
-                            )
+                            .add(theme::ghost("Advanced…").icon(Icon::Sliders))
+                            .on_hover_text("Codecs, resolution, bitrate and your own presets")
                             .clicked()
                         {
                             outcome = ExportOutcome::Advanced;
@@ -517,18 +525,17 @@ impl ExportDialog {
                             if ui
                                 .add_enabled(
                                     can_save,
-                                    theme::primary("Save").min_size(egui::vec2(104.0, 44.0)),
+                                    theme::primary("Save")
+                                        .icon(Icon::Check)
+                                        .height(36.0)
+                                        .min_width(108.0),
                                 )
                                 .clicked()
                             {
                                 save = true;
                             }
                             if ui
-                                .add(
-                                    egui::Button::new("Cancel")
-                                        .min_size(egui::vec2(96.0, 44.0))
-                                        .corner_radius(8),
-                                )
+                                .add(theme::secondary("Cancel").height(36.0).min_width(92.0))
                                 .clicked()
                             {
                                 outcome = ExportOutcome::Closed;
@@ -664,14 +671,14 @@ fn card(
         .map(|r| ui.interact(r, id, egui::Sense::click()).clicked())
         .unwrap_or(false);
     let frame = egui::Frame::new()
-        .fill(if on { ACCENT_BG } else { theme::SURFACE })
+        .fill(if on { ACCENT_SOFT } else { theme::RAISED })
         .stroke(if on {
-            Stroke::new(2.0, ACCENT)
+            Stroke::new(1.5, ACCENT)
         } else {
             Stroke::new(1.0, BORDER)
         })
-        .corner_radius(8)
-        .inner_margin(if on { 15 } else { 16 });
+        .corner_radius(10)
+        .inner_margin(16);
     let r = frame.show(ui, |ui| {
         ui.set_min_height(CARD_H);
         ui.spacing_mut().item_spacing.y = 6.0;
@@ -699,7 +706,7 @@ fn bottom(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 
 fn quality_row(ui: &mut egui::Ui, q: Quality) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(q.label()).strong().color(INK));
+        ui.label(theme::strong(q.label()));
         theme::quality_bars(ui, q.bars());
     });
 }
