@@ -1,11 +1,14 @@
 //! Cutline: open a video, drag two handles, press Export.
 
 mod app;
-mod dialogs;
 mod export;
 mod icons;
+mod modal;
+mod profile;
 mod theme;
 mod timeline;
+#[cfg(test)]
+mod ui_tests;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -28,6 +31,9 @@ fn main() -> eframe::Result<()> {
         println!("cutline {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Cutline draws its own title bar (window buttons in the header).
+    // `CUTLINE_SYSTEM_TITLEBAR=1` keeps the desktop's instead.
+    let csd = !std::env::var_os("CUTLINE_SYSTEM_TITLEBAR").is_some_and(|v| v != "0");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cutline")
@@ -35,6 +41,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1160.0, 780.0])
             .with_min_inner_size([720.0, 540.0])
             .with_drag_and_drop(true)
+            .with_decorations(!csd)
             .with_icon(std::sync::Arc::new(icons::window_icon(64))),
         event_loop_builder: x11_for_drag_and_drop(),
         ..Default::default()
@@ -42,7 +49,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Cutline",
         options,
-        Box::new(move |cc| Ok(Box::new(app::CutlineApp::new(cc, args)))),
+        Box::new(move |cc| Ok(Box::new(app::CutlineApp::new(cc, args, csd)))),
     )
 }
 

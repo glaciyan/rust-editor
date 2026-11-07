@@ -1,20 +1,22 @@
-//! The main window: header with Export, a big viewer with transport and
-//! volume, the timeline with its toolbar, and a status bar.
+//! The main window: a header with Open, the file, undo/redo, Export and the
+//! window buttons; the picture on black; the transport with volume; and the
+//! timeline with its toolbar. Dialogs stack on top (see `modal`).
 
-use crate::dialogs::{AdvancedEditor, DetailsWindow};
-use crate::export::{ExportDialog, ExportOutcome};
-use crate::icons::{self, Icon};
-use crate::theme::{self, MUTED};
+use crate::export::ExportDialog;
+use crate::icons::Icon;
+use crate::modal::{Dialog, Kind};
+use crate::theme::{self, MUTED, TEXT};
 use crate::timeline::{self, TimelineAction, TimelineView};
 use cutline_core::{format, PartMode, Project, Timestamp};
 use cutline_engine::estimate::Calibration;
 use cutline_engine::job::{JobDetails, JobId, JobOutput};
+use cutline_engine::request::ExportRequest;
 use cutline_engine::store::{self, ProfileStore, Session};
 use cutline_engine::{Engine, EngineEvent};
 use cutline_ffmpeg::{probe, MediaInfo, Tools};
 use cutline_preview::thumbs::{ThumbRequest, Thumbnailer};
 use cutline_preview::Player;
-use eframe::egui::{self, Color32, Key, Modifiers, Sense, Stroke};
+use eframe::egui::{self, Color32, Key, Modifiers, Role, Sense, Stroke, WidgetInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -91,11 +93,12 @@ pub struct CutlineApp {
     resume_after_drag: Option<bool>,
     thumbs: Option<Thumbnailer>,
     pub thumb_tex: HashMap<(u64, usize, usize), egui::TextureHandle>,
-    thumb_requested: HashSet<(u64, usize)>,
+    thumb_requested: HashSet<(u64, usize, usize)>,
+    /// Tile counts asked for per video, finest last.
+    thumb_counts: HashMap<u64, Vec<usize>>,
     pub timeline: TimelineView,
-    export: Option<ExportDialog>,
-    advanced: Option<AdvancedEditor>,
-    details: Option<DetailsWindow>,
+    /// Open dialogs, bottom first; only the last one is shown.
+    pub dialogs: Vec<Dialog>,
     pub jobs: Vec<JobView>,
     pub profiles: ProfileStore,
     pub calibrations: HashMap<u64, Option<Calibration>>,
@@ -106,17 +109,28 @@ pub struct CutlineApp {
     saved_session: Option<String>,
     last_session_check: Instant,
     file_dialog_rx: Option<(Receiver<Option<Vec<PathBuf>>>, Instant)>,
-    path_prompt: Option<String>,
-    confirm_quit: bool,
+    /// Quit anyway was pressed: let the next close request through.
+    quitting: bool,
     title: String,
     /// Preview volume 0–100, and whether it's muted.
     pub volume: f64,
     pub muted: bool,
+    /// Read and write the session and profiles on disk. Off in tests.
+    live: bool,
+    /// Draw our own title bar (window buttons, drag to move, edges to resize).
+    csd: bool,
+    viewer_rect: egui::Rect,
+    /// Every export handed to the engine, for the tests.
+    #[cfg(test)]
+    pub submitted: Vec<Vec<PathBuf>>,
 }
 
-const HEADER_H: f32 = 52.0;
-const STATUS_H: f32 = 32.0;
-const TRANSPORT_H: f32 = 68.0;
+const HEADER_H: f32 = 48.0;
+/// Room the zoom buttons take in the timeline toolbar.
+const ZOOM_W: f32 = 120.0;
+/// A thumbnail's request index is `count * THUMB_SLOTS + tile`.
+const THUMB_SLOTS: usize = 100_000;
+const TRANSPORT_H: f32 = 48.0;
 
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -172,24 +186,47 @@ pub fn show_in_folder(path: &Path) {
 }
 
 impl CutlineApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, args: Vec<PathBuf>, csd: bool) -> Self {
         theme::apply(&cc.egui_ctx);
-        let ctx = cc.egui_ctx.clone();
-        let waker: cutline_preview::Waker = Arc::new(move || ctx.request_repaint());
-        let (tools, tools_error) = match Tools::locate() {
+        let mut app = Self::assemble(&cc.egui_ctx, Tools::locate(), true, csd);
+        if let Some(s) = store::load_session() {
+            app.volume = s.volume.clamp(0.0, 100.0);
+            app.muted = s.muted;
+        }
+        app.apply_volume();
+        if args.is_empty() {
+            app.restore_session();
+        } else {
+            app.add_files(args);
+        }
+        app
+    }
+
+    /// The app without its background helpers (player, thumbnails, export
+    /// engine) and without touching the disk: what the UI tests drive.
+    #[cfg(test)]
+    pub fn for_tests(tools: Tools) -> Self {
+        Self::assemble(&egui::Context::default(), Ok(tools), false, true)
+    }
+
+    fn assemble(ctx: &egui::Context, tools: Result<Tools, String>, live: bool, csd: bool) -> Self {
+        let waker: cutline_preview::Waker = {
+            let ctx = ctx.clone();
+            Arc::new(move || ctx.request_repaint())
+        };
+        let (tools, tools_error) = match tools {
             Ok(t) => (Some(Arc::new(t)), None),
             Err(e) => (None, Some(e)),
         };
-        let engine = tools.as_ref().map(|t| {
+        let helpers = tools.as_ref().filter(|_| live);
+        let engine = helpers.map(|t| {
             let e = Engine::new((**t).clone());
-            let ctx = cc.egui_ctx.clone();
+            let ctx = ctx.clone();
             e.set_waker(move || ctx.request_repaint());
             e
         });
-        let player = tools
-            .as_ref()
-            .map(|t| Player::new(&t.ffmpeg, waker.clone()));
-        let thumbs = tools.as_ref().map(|t| {
+        let player = helpers.map(|t| Player::new(&t.ffmpeg, waker.clone()));
+        let thumbs = helpers.map(|t| {
             Thumbnailer::new(
                 t.ffmpeg.clone(),
                 store::cache_dir().join("thumbs"),
@@ -197,7 +234,7 @@ impl CutlineApp {
             )
         });
         let (probe_tx, probe_rx) = channel();
-        let mut app = CutlineApp {
+        CutlineApp {
             tools,
             tools_error,
             engine,
@@ -218,12 +255,15 @@ impl CutlineApp {
             thumbs,
             thumb_tex: HashMap::new(),
             thumb_requested: HashSet::new(),
+            thumb_counts: HashMap::new(),
             timeline: TimelineView::default(),
-            export: None,
-            advanced: None,
-            details: None,
+            dialogs: vec![],
             jobs: vec![],
-            profiles: ProfileStore::load(),
+            profiles: if live {
+                ProfileStore::load()
+            } else {
+                ProfileStore::default()
+            },
             calibrations: HashMap::new(),
             calibrating: HashSet::new(),
             last_export_dir: None,
@@ -232,23 +272,24 @@ impl CutlineApp {
             saved_session: None,
             last_session_check: Instant::now(),
             file_dialog_rx: None,
-            path_prompt: None,
-            confirm_quit: false,
+            quitting: false,
             title: String::new(),
             volume: 100.0,
             muted: false,
-        };
-        if let Some(s) = store::load_session() {
-            app.volume = s.volume.clamp(0.0, 100.0);
-            app.muted = s.muted;
+            live,
+            csd,
+            viewer_rect: egui::Rect::NOTHING,
+            #[cfg(test)]
+            submitted: vec![],
         }
-        app.apply_volume();
-        if args.is_empty() {
-            app.restore_session();
-        } else {
-            app.add_files(args);
+    }
+
+    pub fn save_profiles(&mut self) {
+        if self.live {
+            if let Err(e) = self.profiles.save() {
+                self.toast(format!("Couldn't save your profiles: {e}"));
+            }
         }
-        app
     }
 
     // ---------- files & session ----------
@@ -281,6 +322,9 @@ impl CutlineApp {
     }
 
     fn save_session_if_changed(&mut self, force: bool) {
+        if !self.live {
+            return;
+        }
         if !force && self.last_session_check.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -447,7 +491,7 @@ impl CutlineApp {
                 match r {
                     Some(files) => self.add_files(files),
                     // No file chooser on this system: ask for a path instead.
-                    None if quick => self.path_prompt = Some(String::new()),
+                    None if quick => self.push_dialog(Dialog::OpenPath(String::new())),
                     None => {}
                 }
             }
@@ -613,7 +657,7 @@ impl CutlineApp {
     // ---------- export ----------
 
     pub fn open_export(&mut self) {
-        if self.project.is_empty() || self.tools.is_none() {
+        if self.project.is_empty() || self.tools.is_none() || self.has_dialog(Kind::Export) {
             return;
         }
         if self.project.segments().is_empty() {
@@ -623,7 +667,30 @@ impl CutlineApp {
         if let Some(p) = &mut self.player {
             p.set_paused(true);
         }
-        self.export = Some(ExportDialog::new(self));
+        let d = ExportDialog::new(self);
+        self.push_dialog(Dialog::Export(Box::new(d)));
+    }
+
+    pub fn submit_export(&mut self, req: ExportRequest, outputs: Vec<PathBuf>) {
+        #[cfg(test)]
+        self.submitted.push(outputs.clone());
+        if let Some(e) = &self.engine {
+            e.submit(req, outputs);
+        }
+    }
+
+    /// Quit anyway: stop the exports, keep the session, close.
+    pub fn quit_now(&mut self, ctx: &egui::Context) {
+        if let Some(e) = &self.engine {
+            e.cancel_all();
+        }
+        self.save_session_if_changed(true);
+        self.quitting = true;
+        // Give the worker a moment to kill ffmpeg and clean up.
+        if self.live {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
     pub fn request_calibration(&mut self, key: u64, req: cutline_engine::ExportRequest) {
@@ -730,15 +797,18 @@ impl CutlineApp {
                 egui::TextureOptions::LINEAR,
             );
             self.thumb_tex
-                .insert((r.clip, r.index / 1000, r.index % 1000), tex);
+                .insert((r.clip, r.index / THUMB_SLOTS, r.index % THUMB_SLOTS), tex);
         }
     }
 
-    /// Ask for `count` thumbnails across a clip (cached per count).
-    pub fn want_thumbs(&mut self, clip: u64, count: usize, tile_h: usize) {
-        if self.thumb_requested.contains(&(clip, count)) {
-            return;
-        }
+    /// Ask for tiles `range` of a clip cut into `count` thumbnails.
+    pub fn want_thumbs(
+        &mut self,
+        clip: u64,
+        count: usize,
+        tile_h: usize,
+        range: std::ops::Range<usize>,
+    ) {
         let Some(c) = self.project.clip(clip) else {
             return;
         };
@@ -750,16 +820,24 @@ impl CutlineApp {
         let (dw, dh) = v.display_size();
         let h = tile_h.max(16);
         let w = ((h as f64 * dw as f64 / dh.max(1) as f64).round() as usize).clamp(16, 400) / 2 * 2;
-        self.thumb_requested.insert((clip, count));
         let dur = c.duration.secs();
+        let counts = self.thumb_counts.entry(clip).or_default();
+        if !counts.contains(&count) {
+            counts.push(count);
+            counts.sort_unstable();
+        }
         // Middle tiles first feels faster than left-to-right.
-        let mut order: Vec<usize> = (0..count).collect();
-        order.sort_by_key(|i| (*i as i64 * 2 - count as i64).abs());
+        let mid = (range.start + range.end) as i64;
+        let mut order: Vec<usize> = range
+            .filter(|i| !self.thumb_requested.contains(&(clip, count, *i)))
+            .collect();
+        order.sort_by_key(|i| (*i as i64 * 2 - mid).abs());
         for i in order {
+            self.thumb_requested.insert((clip, count, i));
             t.request(ThumbRequest {
                 clip,
                 path: c.path.clone(),
-                index: count * 1000 + i,
+                index: count * THUMB_SLOTS + i,
                 time: (i as f64 + 0.5) * dur / count as f64,
                 width: w,
                 height: h,
@@ -767,11 +845,26 @@ impl CutlineApp {
         }
     }
 
+    /// Tile `j` of `count`, or while it loads, the loaded tile of another
+    /// count that shows the same moment (finest first).
+    pub fn thumb_for(&self, clip: u64, count: usize, j: usize) -> Option<&egui::TextureHandle> {
+        if let Some(t) = self.thumb_tex.get(&(clip, count, j)) {
+            return Some(t);
+        }
+        let at = (j as f64 + 0.5) / count as f64;
+        self.thumb_counts.get(&clip)?.iter().rev().find_map(|&c| {
+            let k = ((at * c as f64) as usize).min(c - 1);
+            self.thumb_tex.get(&(clip, c, k))
+        })
+    }
+
     // ---------- keyboard ----------
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let typing = ctx.egui_wants_keyboard_input();
-        let modal = self.export.is_some() || self.path_prompt.is_some();
+        // A dialog has the keyboard to itself (Esc, Enter, typing).
+        if !self.dialogs.is_empty() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
         let mut actions = vec![];
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::E) {
@@ -779,9 +872,6 @@ impl CutlineApp {
             }
             if i.consume_key(Modifiers::COMMAND, Key::O) {
                 actions.push("open");
-            }
-            if typing || modal {
-                return;
             }
             if i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
                 || i.consume_key(Modifiers::COMMAND, Key::Y)
@@ -791,49 +881,35 @@ impl CutlineApp {
             if i.consume_key(Modifiers::COMMAND, Key::Z) {
                 actions.push("undo");
             }
-            if i.consume_key(Modifiers::NONE, Key::Space) {
-                actions.push("play");
-            }
-            if i.consume_key(Modifiers::NONE, Key::I) {
-                actions.push("in");
-            }
-            if i.consume_key(Modifiers::NONE, Key::O) {
-                actions.push("out");
-            }
-            if i.consume_key(Modifiers::NONE, Key::Delete)
-                || i.consume_key(Modifiers::NONE, Key::Backspace)
-            {
-                actions.push("delete");
-            }
-            if i.consume_key(Modifiers::NONE, Key::ArrowLeft) {
-                actions.push("prev-frame");
-            }
-            if i.consume_key(Modifiers::NONE, Key::ArrowRight) {
-                actions.push("next-frame");
-            }
+            let plain = [
+                (Key::Space, "play"),
+                (Key::I, "in"),
+                (Key::O, "out"),
+                (Key::S, "split"),
+                (Key::A, "add"),
+                (Key::Delete, "delete"),
+                (Key::Backspace, "delete"),
+                (Key::ArrowLeft, "prev-frame"),
+                (Key::ArrowRight, "next-frame"),
+                (Key::Home, "home"),
+                (Key::End, "end"),
+                (Key::M, "mute"),
+                (Key::ArrowUp, "vol-up"),
+                (Key::ArrowDown, "vol-down"),
+                (Key::Equals, "zoom-in"),
+                (Key::Plus, "zoom-in"),
+                (Key::Minus, "zoom-out"),
+            ];
             if i.consume_key(Modifiers::SHIFT, Key::ArrowLeft) {
                 actions.push("back-1s");
             }
             if i.consume_key(Modifiers::SHIFT, Key::ArrowRight) {
                 actions.push("fwd-1s");
             }
-            if i.consume_key(Modifiers::NONE, Key::Home) {
-                actions.push("home");
-            }
-            if i.consume_key(Modifiers::NONE, Key::End) {
-                actions.push("end");
-            }
-            if i.consume_key(Modifiers::NONE, Key::A) {
-                actions.push("add");
-            }
-            if i.consume_key(Modifiers::NONE, Key::M) {
-                actions.push("mute");
-            }
-            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
-                actions.push("vol-up");
-            }
-            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
-                actions.push("vol-down");
+            for (key, action) in plain {
+                if i.consume_key(Modifiers::NONE, key) {
+                    actions.push(action);
+                }
             }
         });
         for a in actions {
@@ -851,20 +927,19 @@ impl CutlineApp {
             "in" | "out" => {
                 if let Some((clip, t)) = self.playhead {
                     self.checkpoint();
-                    if a == "in" {
-                        self.project.set_in(clip, t);
+                    let done = if a == "in" {
+                        self.project.set_in(clip, t)
                     } else {
-                        self.project.set_out(clip, t);
+                        self.project.set_out(clip, t)
+                    };
+                    if done.is_none() {
+                        self.undo.pop();
                     }
                     self.was_in_kept = self.project.is_kept(clip, t);
                 }
             }
-            "delete" => {
-                if let Some(s) = self.project.selected {
-                    self.checkpoint();
-                    self.project.remove_part(s);
-                }
-            }
+            "split" => self.split_at_playhead(),
+            "delete" => self.delete_selected_part(),
             "prev-frame" => self.frame_step(-1.0),
             "next-frame" => self.frame_step(1.0),
             "back-1s" | "fwd-1s" => {
@@ -896,6 +971,8 @@ impl CutlineApp {
             "mute" => self.toggle_mute(),
             "vol-up" => self.set_volume(self.shown_volume() + 5.0),
             "vol-down" => self.set_volume(self.shown_volume() - 5.0),
+            "zoom-in" => self.zoom_timeline(2.0),
+            "zoom-out" => self.zoom_timeline(0.5),
             _ => {}
         }
     }
@@ -920,6 +997,47 @@ impl CutlineApp {
             self.undo.pop();
             self.toast("There's no room for another part in this video.".into());
         }
+    }
+
+    /// Zoom the timeline around the playhead (around the middle of the view
+    /// when the playhead is out of it).
+    pub fn zoom_timeline(&mut self, factor: f64) {
+        let total = self.project.total_duration().secs();
+        if total <= 0.0 {
+            return;
+        }
+        let (start, span) = self.timeline.window(total);
+        let anchor = self
+            .playhead
+            .map(|(c, t)| self.project.clip_offset(c).secs() + t.secs())
+            .filter(|t| *t >= start && *t <= start + span)
+            .unwrap_or(start + span / 2.0);
+        let min = self.timeline.min_span(self.current_fps());
+        self.timeline.zoom(total, factor, anchor, min);
+    }
+
+    pub fn split_at_playhead(&mut self) {
+        let Some((clip, t)) = self.playhead else {
+            return;
+        };
+        self.checkpoint();
+        if self.project.split_part(clip, t).is_none() {
+            self.undo.pop();
+            self.toast("Put the playhead inside a part, away from its ends, to split it.".into());
+        }
+    }
+
+    pub fn delete_selected_part(&mut self) {
+        if let Some(s) = self.selected_part() {
+            self.checkpoint();
+            self.project.remove_part(s);
+        }
+    }
+
+    fn selected_part(&self) -> Option<cutline_core::PartRef> {
+        self.project
+            .selected
+            .filter(|r| self.project.part(*r).is_some())
     }
 
     // ---------- drawing ----------
@@ -949,6 +1067,22 @@ impl CutlineApp {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         let full = ui.max_rect();
+        let ctx = ui.ctx().clone();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        // Drag the window by its header; the buttons on it still get their clicks.
+        if self.csd {
+            let bar = ui.interact(
+                full.expand2(egui::vec2(10.0, 0.0)),
+                ui.scope_id().with("title-bar"),
+                Sense::click_and_drag(),
+            );
+            if bar.drag_started_by(egui::PointerButton::Primary) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if bar.double_clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+        }
         let mut undo = false;
         let mut redo = false;
 
@@ -957,14 +1091,8 @@ impl CutlineApp {
                 .max_rect(full)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        let (logo, _) = left.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
-        icons::logo(left.painter(), logo);
-        left.add_space(2.0);
-        left.label(theme::strong("Cutline").size(14.5));
-        left.add_space(4.0);
-        theme::vsep(&mut left, 22.0);
         if left
-            .add(theme::secondary("Open").icon(Icon::Open))
+            .add(theme::ghost("Open").icon(Icon::Open).height(32.0))
             .on_hover_text("Open videos (Ctrl+O)")
             .clicked()
         {
@@ -977,27 +1105,52 @@ impl CutlineApp {
                 .max_rect(full)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
+        right.spacing_mut().item_spacing.x = 4.0;
+        if self.csd {
+            if window_button(&mut right, Icon::Close, "Close window", true).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            let (icon, label) = if maximized {
+                (Icon::Restore, "Restore window")
+            } else {
+                (Icon::Maximize, "Maximize window")
+            };
+            if window_button(&mut right, icon, label, false).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+            if window_button(&mut right, Icon::Minimize, "Minimize window", false).clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            theme::vsep(&mut right, 20.0);
+        }
         let enabled = !self.project.is_empty() && self.tools.is_some();
         if right
-            .add_enabled(
-                enabled,
-                theme::primary("Export")
-                    .icon(Icon::Export)
-                    .height(34.0)
-                    .min_width(112.0),
-            )
+            .add_enabled(enabled, theme::primary("Export").icon(Icon::Export))
             .on_hover_text("Export (Ctrl+E)")
             .clicked()
         {
             self.open_export();
         }
-        right.add_space(4.0);
-        theme::vsep(&mut right, 22.0);
+        right.add_space(6.0);
         right.add_enabled_ui(!self.redo.is_empty(), |ui| {
-            redo = theme::icon_button(ui, Icon::Redo, 32.0, "Redo (Ctrl+Shift+Z)").clicked();
+            redo = theme::icon_button(
+                ui,
+                Icon::Redo,
+                egui::vec2(32.0, 32.0),
+                "Redo",
+                "Redo (Ctrl+Shift+Z)",
+            )
+            .clicked();
         });
         right.add_enabled_ui(!self.undo.is_empty(), |ui| {
-            undo = theme::icon_button(ui, Icon::Undo, 32.0, "Undo (Ctrl+Z)").clicked();
+            undo = theme::icon_button(
+                ui,
+                Icon::Undo,
+                egui::vec2(32.0, 32.0),
+                "Undo",
+                "Undo (Ctrl+Z)",
+            )
+            .clicked();
         });
         let right_start = right.min_rect().left();
         if undo {
@@ -1016,23 +1169,25 @@ impl CutlineApp {
         let name_g = p.layout_no_wrap(
             name,
             egui::FontId::new(13.5, theme::semibold_family()),
-            theme::TEXT,
+            TEXT,
         );
         let room = (right_start - left_end - 32.0).max(0.0);
-        let chip_w = |f: &String| {
-            p.layout_no_wrap(f.clone(), egui::FontId::proportional(11.5), MUTED)
-                .size()
-                .x
-                + 14.0
+        let facts_g = |facts: &Vec<String>| {
+            p.layout_no_wrap(facts.join(" · "), egui::FontId::proportional(12.0), MUTED)
         };
         let width = |facts: &Vec<String>| {
-            name_g.size().x + facts.iter().map(|f| chip_w(f) + 6.0).sum::<f32>() + 6.0
+            name_g.size().x
+                + if facts.is_empty() {
+                    0.0
+                } else {
+                    10.0 + facts_g(facts).size().x
+                }
         };
         while !facts.is_empty() && width(&facts) > room {
             facts.remove(0);
         }
         let w = width(&facts).min(room);
-        let mut x = (full.center().x - w / 2.0)
+        let x = (full.center().x - w / 2.0)
             .max(left_end + 16.0)
             .min(right_start - 16.0 - w);
         let cy = full.center().y;
@@ -1040,37 +1195,20 @@ impl CutlineApp {
             egui::Rect::from_x_y_ranges(left_end + 16.0..=right_start - 16.0, full.y_range());
         let p = p.with_clip_rect(clip);
         let nw = name_g.size();
-        p.galley(egui::pos2(x, cy - nw.y / 2.0), name_g, theme::TEXT);
-        x += nw.x + 12.0;
-        for f in facts {
-            let g = p.layout_no_wrap(f, egui::FontId::proportional(11.5), MUTED);
-            let r = egui::Rect::from_min_size(
-                egui::pos2(x, cy - 11.0),
-                egui::vec2(g.size().x + 14.0, 22.0),
-            );
-            p.rect(
-                r,
-                5,
-                theme::RAISED,
-                Stroke::new(1.0, theme::HAIRLINE),
-                egui::StrokeKind::Inside,
-            );
-            p.galley(r.center() - g.size() / 2.0, g, MUTED);
-            x = r.right() + 6.0;
+        // Line the two up on their baselines.
+        let base = cy + nw.y * 0.3;
+        p.galley(egui::pos2(x, cy - nw.y / 2.0), name_g, TEXT);
+        if !facts.is_empty() {
+            let g = facts_g(&facts);
+            let gy = base - g.size().y * 0.8;
+            p.galley(egui::pos2(x + nw.x + 10.0, gy), g, MUTED);
         }
     }
 
-    fn viewer(&mut self, ui: &mut egui::Ui, height: f32) {
-        let (rect, resp) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+    fn viewer(&mut self, ui: &mut egui::Ui) {
+        let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        self.viewer_rect = rect;
         let painter = ui.painter_at(rect);
-        painter.rect(
-            rect,
-            10,
-            theme::VIEWER,
-            Stroke::new(1.0, theme::HAIRLINE),
-            egui::StrokeKind::Inside,
-        );
         if self.project.is_empty() && self.pending.is_empty() {
             self.empty_state(ui, rect);
             return;
@@ -1094,6 +1232,7 @@ impl CutlineApp {
             );
             return;
         }
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "Preview"));
         // Render the next frame at the on-screen pixel size.
         let ppp = ui.ctx().pixels_per_point();
         let (mw, mh) = (
@@ -1116,14 +1255,11 @@ impl CutlineApp {
                 }
             }
         }
-        let inner = rect.shrink(1.0);
         if let Some(t) = &self.preview {
             let [w, h] = self.preview_size;
-            let s = (inner.width() / w as f32).min(inner.height() / h as f32);
-            let r = egui::Rect::from_center_size(
-                inner.center(),
-                egui::vec2(w as f32 * s, h as f32 * s),
-            );
+            let s = (rect.width() / w as f32).min(rect.height() / h as f32);
+            let r =
+                egui::Rect::from_center_size(rect.center(), egui::vec2(w as f32 * s, h as f32 * s));
             painter.image(
                 t.id(),
                 r,
@@ -1140,7 +1276,7 @@ impl CutlineApp {
                     Color32::WHITE,
                 );
                 let badge = egui::Rect::from_min_size(
-                    rect.left_top() + egui::vec2(14.0, 14.0),
+                    rect.left_top() + egui::vec2(12.0, 12.0),
                     egui::vec2(g.size().x + 34.0, 28.0),
                 );
                 painter.rect(
@@ -1183,7 +1319,7 @@ impl CutlineApp {
 
     fn empty_state(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let p = ui.painter_at(rect);
-        let r = rect.shrink(14.0);
+        let r = rect.shrink(16.0);
         let pts = vec![
             r.left_top(),
             r.right_top(),
@@ -1201,7 +1337,7 @@ impl CutlineApp {
         let c = rect.center() + egui::vec2(0.0, if tall { 18.0 } else { -4.0 });
         if tall {
             let ic = c - egui::vec2(0.0, 92.0);
-            p.circle(ic, 32.0, theme::RAISED, Stroke::new(1.0, theme::BORDER));
+            p.circle(ic, 32.0, theme::PANEL, Stroke::new(1.0, theme::BORDER));
             Icon::Film.paint(
                 &p,
                 egui::Rect::from_center_size(ic, egui::vec2(28.0, 28.0)),
@@ -1213,7 +1349,7 @@ impl CutlineApp {
             egui::Align2::CENTER_CENTER,
             "Drop videos here",
             egui::FontId::new(20.0, theme::semibold_family()),
-            theme::TEXT,
+            TEXT,
         );
         p.text(
             c - egui::vec2(0.0, 10.0),
@@ -1222,7 +1358,7 @@ impl CutlineApp {
             egui::FontId::proportional(13.0),
             MUTED,
         );
-        let b = egui::Rect::from_center_size(c + egui::vec2(0.0, 32.0), egui::vec2(160.0, 38.0));
+        let b = egui::Rect::from_center_size(c + egui::vec2(0.0, 32.0), egui::vec2(160.0, 36.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(b).layout(
             egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
         ));
@@ -1230,7 +1366,7 @@ impl CutlineApp {
             .add(
                 theme::primary("Open videos…")
                     .icon(Icon::Open)
-                    .height(38.0)
+                    .height(36.0)
                     .min_width(160.0),
             )
             .clicked()
@@ -1242,11 +1378,11 @@ impl CutlineApp {
             egui::Align2::CENTER_CENTER,
             "or press Ctrl+O",
             egui::FontId::proportional(12.0),
-            theme::FAINT,
+            MUTED,
         );
     }
 
-    fn current_fps(&self) -> f64 {
+    pub fn current_fps(&self) -> f64 {
         self.playhead
             .and_then(|(c, _)| self.project.clip(c))
             .or_else(|| self.project.clips.first())
@@ -1256,47 +1392,55 @@ impl CutlineApp {
     }
 
     fn transport(&mut self, ui: &mut egui::Ui) {
-        let (row, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), TRANSPORT_H),
-            Sense::hover(),
-        );
+        let row = ui.max_rect();
         let has_media = !self.project.is_empty();
 
-        // Centre: transport buttons.
-        let center_w = 32.0 * 4.0 + 44.0 + 6.0 * 4.0 + 8.0;
-        let cr = egui::Rect::from_center_size(row.center(), egui::vec2(center_w, 44.0));
+        // Centre: previous frame, play, next frame in one track.
+        let cr = egui::Rect::from_center_size(
+            row.center(),
+            egui::vec2(2.0 * 30.0 + 38.0 + 4.0 + 6.0, 34.0),
+        );
+        ui.painter().rect(
+            cr,
+            8,
+            theme::BG,
+            Stroke::new(1.0, theme::HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
         let mut actions: Vec<&str> = vec![];
         let mut c = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(cr)
+                .max_rect(cr.shrink(3.0))
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        c.spacing_mut().item_spacing.x = 6.0;
+        c.spacing_mut().item_spacing.x = 2.0;
         c.add_enabled_ui(has_media, |ui| {
-            if theme::icon_button(ui, Icon::ToStart, 32.0, "Go to start (Home)").clicked() {
-                actions.push("home");
-            }
-            if theme::icon_button(ui, Icon::StepBack, 32.0, "One frame back (←)").clicked() {
+            let s = egui::vec2(30.0, 28.0);
+            if theme::icon_button(
+                ui,
+                Icon::StepBack,
+                s,
+                "Previous frame",
+                "Previous frame (←)",
+            )
+            .clicked()
+            {
                 actions.push("prev-frame");
             }
-            ui.add_space(4.0);
             if self.play_button(ui).clicked() {
                 actions.push("play");
             }
-            ui.add_space(4.0);
-            if theme::icon_button(ui, Icon::StepForward, 32.0, "One frame forward (→)").clicked()
+            if theme::icon_button(ui, Icon::StepForward, s, "Next frame", "Next frame (→)")
+                .clicked()
             {
                 actions.push("next-frame");
-            }
-            if theme::icon_button(ui, Icon::ToEnd, 32.0, "Go to end (End)").clicked() {
-                actions.push("end");
             }
         });
         for a in actions {
             self.run_action(a);
         }
 
-        // Left: timecode.
+        // Left: where the playhead is, and the whole length.
         let fps = self.current_fps();
         let now = self
             .playhead
@@ -1305,33 +1449,35 @@ impl CutlineApp {
         let total = self.project.total_duration();
         let p = ui.painter();
         let cur = p.layout_no_wrap(
-            timecode(now.secs(), fps),
-            egui::FontId::monospace(17.0),
-            if has_media { theme::TEXT } else { theme::FAINT },
+            clock_ms(now.secs()),
+            theme::MONO(15.0),
+            if has_media { TEXT } else { MUTED },
         );
         let tot = p.layout_no_wrap(
-            format!("/ {}", timecode(total.secs(), fps)),
-            egui::FontId::monospace(12.0),
-            theme::FAINT,
+            format!("/ {}", clock_ms(total.secs())),
+            theme::MONO(12.5),
+            MUTED,
         );
         let left_room = cr.left() - row.left() - 12.0;
         let cy = row.center().y;
-        let tc_rect = egui::Rect::from_min_size(
-            egui::pos2(row.left() + 4.0, cy - cur.size().y / 2.0),
-            cur.size(),
-        );
+        let tc_rect =
+            egui::Rect::from_min_size(egui::pos2(row.left(), cy - cur.size().y / 2.0), cur.size());
         let cur_w = cur.size().x;
         if cur_w + 8.0 <= left_room {
-            p.galley(tc_rect.min, cur, theme::TEXT);
-            if cur_w + 12.0 + tot.size().x <= left_room {
+            p.galley(tc_rect.min, cur, TEXT);
+            if cur_w + 8.0 + tot.size().x <= left_room {
                 p.galley(
-                    egui::pos2(tc_rect.right() + 10.0, cy - tot.size().y / 2.0 + 1.0),
+                    egui::pos2(tc_rect.right() + 7.0, cy - tot.size().y / 2.0 + 1.0),
                     tot,
-                    theme::FAINT,
+                    MUTED,
                 );
             }
+            let frame = (now.secs() * fps).round() as u64;
             ui.interact(tc_rect, ui.scope_id().with("tc"), Sense::hover())
-                .on_hover_text("Hours : minutes : seconds : frames");
+                .on_hover_text(format!(
+                    "Hours : minutes : seconds . milliseconds · frame {frame} at {} fps",
+                    trim_fps(fps)
+                ));
         }
 
         // Right: volume.
@@ -1341,42 +1487,39 @@ impl CutlineApp {
                 .max_rect(rr)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
-        r.spacing_mut().item_spacing.x = 4.0;
+        r.spacing_mut().item_spacing.x = 6.0;
         self.volume_control(&mut r);
     }
 
-    /// The round play / pause button in the middle of the transport.
+    /// Play / pause, the one lit button in the transport track.
     fn play_button(&self, ui: &mut egui::Ui) -> egui::Response {
         let playing = self.playing();
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), Sense::click());
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(38.0, 28.0), Sense::click());
         let enabled = ui.is_enabled();
+        let label = if playing { "Pause" } else { "Play" };
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, label));
         let p = ui.painter();
         let fill = if !enabled {
             theme::RAISED
         } else if resp.is_pointer_button_down_on() {
-            Color32::from_gray(200)
+            theme::BORDER
         } else if resp.hovered() {
-            Color32::WHITE
+            theme::SEGMENT_ON
         } else {
-            Color32::from_gray(232)
+            theme::HOVER
         };
-        p.circle_filled(r.center(), 21.0, fill);
-        let fg = if enabled { theme::VIEWER } else { theme::FAINT };
+        p.rect_filled(r, 6, fill);
+        let fg = if enabled { TEXT } else { theme::FAINT };
         let icon = if playing { Icon::Pause } else { Icon::Play };
-        let off = if playing { 0.0 } else { 1.5 };
         icon.paint(
             p,
-            egui::Rect::from_center_size(r.center() + egui::vec2(off, 0.0), egui::vec2(20.0, 20.0)),
+            egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0)),
             fg,
         );
         if resp.hovered() && enabled {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
-        resp.on_hover_text(if playing {
-            "Pause (Space)"
-        } else {
-            "Play (Space)"
-        })
+        resp.on_hover_text("Play / pause (Space)")
     }
 
     pub fn set_volume(&mut self, v: f64) {
@@ -1406,27 +1549,27 @@ impl CutlineApp {
         }
     }
 
-    /// Mute button, slider and percentage, laid out right to left.
+    /// Mute button, a thin slider and the number, laid out right to left.
     fn volume_control(&mut self, ui: &mut egui::Ui) {
         let has_sound = self.player.as_ref().map(|p| p.has_sound()).unwrap_or(false);
-        let shown = if self.muted { 0.0 } else { self.volume };
-        // Percentage.
-        let (pr, _) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), Sense::hover());
+        let shown = self.shown_volume();
+        // The number.
+        let (pr, _) = ui.allocate_exact_size(egui::vec2(24.0, 20.0), Sense::hover());
         ui.painter().text(
             pr.right_center(),
             egui::Align2::RIGHT_CENTER,
             if has_sound {
-                format!("{shown:.0}%")
+                format!("{shown:.0}")
             } else {
                 "—".into()
             },
-            egui::FontId::monospace(11.5),
-            theme::FAINT,
+            theme::MONO(11.0),
+            MUTED,
         );
         // Slider.
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(108.0, 24.0), Sense::click_and_drag());
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(80.0, 24.0), Sense::click_and_drag());
         let track =
-            egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 12.0, 4.0));
+            egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 8.0, 2.0));
         if has_sound {
             if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
@@ -1441,34 +1584,37 @@ impl CutlineApp {
                 }
             }
         }
-        let shown = if self.muted { 0.0 } else { self.volume };
+        let shown = self.shown_volume();
+        resp.widget_info(|| WidgetInfo::slider(has_sound, shown, "Volume"));
         let active = has_sound && (resp.hovered() || resp.dragged());
         let p = ui.painter();
-        p.rect_filled(track, 2, theme::HOVER);
+        p.rect_filled(track, 1, theme::BORDER);
         let kx = track.left() + track.width() * (shown / 100.0) as f32;
         let filled = egui::Rect::from_min_max(track.min, egui::pos2(kx, track.max.y));
-        let fill = if !has_sound {
-            theme::BORDER
-        } else if active {
-            theme::ACCENT
-        } else {
-            Color32::from_gray(200)
-        };
-        p.rect_filled(filled, 2, fill);
+        p.rect_filled(
+            filled,
+            1,
+            if !has_sound {
+                theme::BORDER
+            } else if active {
+                TEXT
+            } else {
+                MUTED
+            },
+        );
         if has_sound {
-            let kr = if active { 7.0 } else { 6.0 };
-            p.circle_filled(
-                egui::pos2(kx, track.center().y + 1.0),
-                kr,
-                Color32::from_black_alpha(90),
+            p.rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(kx, track.center().y),
+                    egui::vec2(3.0, 12.0),
+                ),
+                1,
+                TEXT,
             );
-            p.circle_filled(egui::pos2(kx, track.center().y), kr, Color32::WHITE);
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
-        }
-        if has_sound {
-            resp.on_hover_text(format!("Volume {shown:.0}% · scroll or ↑ / ↓ to change"));
+            resp.on_hover_text(format!("Volume {shown:.0} · scroll or ↑ / ↓ to change"));
         } else {
             resp.on_hover_text("The preview has no sound. Install libmpv to hear it.");
         }
@@ -1482,155 +1628,174 @@ impl CutlineApp {
         };
         let mut toggle = false;
         ui.add_enabled_ui(has_sound, |ui| {
-            toggle = theme::icon_button(
-                ui,
-                icon,
-                32.0,
-                if self.muted { "Unmute (M)" } else { "Mute (M)" },
-            )
-            .clicked();
+            let (label, tip) = if self.muted {
+                ("Unmute", "Unmute (M)")
+            } else {
+                ("Mute", "Mute (M)")
+            };
+            toggle = theme::icon_button(ui, icon, egui::vec2(28.0, 28.0), label, tip).clicked();
         });
         if toggle {
             self.toggle_mute();
         }
     }
 
-    /// The toolbar above the timeline: add/delete parts, keep or remove, totals.
+    /// The row above the timeline: Split, Delete part, the I/O hint and the totals.
     fn edit_toolbar(&mut self, ui: &mut egui::Ui) {
         let has_media = !self.project.is_empty();
         ui.horizontal(|ui| {
-            ui.set_min_height(34.0);
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if ui
-                .add_enabled(has_media, theme::secondary("Add part").icon(Icon::Plus))
-                .on_hover_text("Add a part at the playhead (A)")
-                .clicked()
-            {
-                self.add_part_at_playhead();
-            }
-            let selected = self
-                .project
-                .selected
-                .filter(|r| self.project.part(*r).is_some());
+            ui.set_min_height(30.0);
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let splittable = has_media
+                && self
+                    .playhead
+                    .and_then(|(c, t)| {
+                        let mut p = self.project.clone();
+                        p.split_part(c, t)
+                    })
+                    .is_some();
             if ui
                 .add_enabled(
-                    selected.is_some(),
-                    theme::Btn::new(theme::Kind::Danger, "Delete part").icon(Icon::Close),
+                    splittable,
+                    theme::secondary("Split")
+                        .icon(Icon::Scissors)
+                        .kbd("S")
+                        .height(30.0),
                 )
-                .on_hover_text("Delete the selected part (Delete)")
+                .on_hover_text("Split the part at the playhead (S)")
+                .on_disabled_hover_text("Put the playhead inside a part to split it")
+                .clicked()
+            {
+                self.split_at_playhead();
+            }
+            if ui
+                .add_enabled(
+                    self.selected_part().is_some(),
+                    theme::secondary("Delete part")
+                        .icon(Icon::Trash)
+                        .kbd("Del")
+                        .height(30.0),
+                )
+                .on_hover_text("Delete the selected part (Del)")
                 .on_disabled_hover_text("Click a part on the timeline to select it")
                 .clicked()
             {
-                if let Some(s) = selected {
-                    self.checkpoint();
-                    self.project.remove_part(s);
-                }
+                self.delete_selected_part();
             }
-            theme::vsep(ui, 22.0);
-            let keep = self.project.mode == PartMode::Keep;
-            ui.add_enabled_ui(has_media, |ui| {
-                let picked = theme::segmented(
-                    ui,
-                    &["Keep selected", "Remove selected"],
-                    if keep { 0 } else { 1 },
-                );
-                match picked {
-                    Some(0) if !keep => {
-                        self.checkpoint();
-                        self.project.set_mode(PartMode::Keep);
-                    }
-                    Some(1) if keep => {
-                        self.checkpoint();
-                        self.project.set_mode(PartMode::Remove);
-                    }
-                    _ => {}
-                }
-            })
-            .response
-            .on_hover_text("Keep selected: the marked parts are what you export.\nRemove selected: the marked parts are cut out.");
+            // Totals on the right; the hint fills what's left between, if it fits.
+            let summary = self.part_summary();
+            let summary_w = summary
+                .as_ref()
+                .map(|(a, b, _)| {
+                    let p = ui.painter();
+                    p.layout_no_wrap(
+                        a.clone(),
+                        egui::FontId::new(13.0, theme::semibold_family()),
+                        TEXT,
+                    )
+                    .size()
+                    .x + 6.0
+                        + p.layout_no_wrap(b.clone(), egui::FontId::proportional(12.5), MUTED)
+                            .size()
+                            .x
+                })
+                .unwrap_or(0.0);
+            if ui.available_width() - summary_w - ZOOM_W > 220.0 {
+                ui.add_space(6.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(theme::small("Set start and end with"));
+                theme::keycap(ui, "I");
+                theme::keycap(ui, "O");
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !has_media {
-                    return;
-                }
-                let segs = self.project.segments();
-                let total: f64 = segs.iter().map(|s| s.len().secs()).sum();
-                if segs.is_empty() {
-                    ui.label(egui::RichText::new("Everything is cut out").color(theme::DANGER));
-                    return;
-                }
-                // Drop the totals rather than overlap the controls in a narrow window.
-                let room = ui.available_width();
-                if room < 150.0 {
-                    return;
-                }
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(theme::strong(format::length(total)).size(13.0));
-                ui.label(theme::caption("Export length"));
-                if room < 240.0 {
-                    return;
+                self.zoom_controls(ui, has_media);
+                theme::vsep(ui, 20.0);
+                if let Some((count, rest, ok)) = summary {
+                    if !ok {
+                        ui.label(egui::RichText::new(count).color(theme::DANGER));
+                        return;
+                    }
+                    if ui.available_width() < summary_w {
+                        return;
+                    }
+                    ui.label(theme::small(rest).size(12.5));
+                    ui.label(theme::strong(count).size(13.0));
                 }
-                ui.add_space(14.0);
-                let n = segs.len();
-                ui.label(theme::strong(n.to_string()).size(13.0));
-                ui.label(theme::caption(if n == 1 { "Part" } else { "Parts" }));
             });
         });
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let shown_job = self.job_status(ui);
-            if !shown_job {
-                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
-                let has_sound = self.player.as_ref().map(|p| p.has_sound()).unwrap_or(true);
-                ui.painter().circle_filled(
-                    dot.center(),
-                    3.5,
-                    if self.project.is_empty() {
-                        theme::FAINT
-                    } else {
-                        theme::SUCCESS
-                    },
-                );
-                ui.label(theme::small(if self.project.is_empty() {
-                    "No video open"
-                } else {
-                    "Ready"
-                }));
-                if !has_sound {
-                    ui.label(theme::small(
-                        "· Preview has no sound (install libmpv for sound)",
-                    ));
-                }
-            }
-            // Shortcut hints on the right, if they fit.
-            let hints: [(&str, &str); 5] = [
-                ("Space", "Play"),
-                ("I  O", "Start / end"),
-                ("A", "Add part"),
-                ("← →", "Frame"),
-                ("M", "Mute"),
-            ];
-            let need = 430.0;
-            if ui.available_width() > need {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 5.0;
-                    for (i, (k, what)) in hints.iter().rev().enumerate() {
-                        if i > 0 {
-                            ui.add_space(8.0);
-                        }
-                        ui.label(egui::RichText::new(*what).size(11.5).color(theme::FAINT));
-                        keycap(ui, k);
-                    }
-                });
+    /// Zoom out, zoom in and Fit, right to left.
+    fn zoom_controls(&mut self, ui: &mut egui::Ui, has_media: bool) {
+        let total = self.project.total_duration().secs();
+        let zoomed = self.timeline.is_zoomed();
+        let (_, span) = self.timeline.window(total);
+        let deepest = span <= self.timeline.min_span(self.current_fps()) * 1.001;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let s = egui::vec2(28.0, 28.0);
+        ui.add_enabled_ui(has_media && zoomed, |ui| {
+            if ui
+                .add(theme::ghost("Fit").label("Fit timeline").height(28.0))
+                .on_hover_text("Show the whole timeline")
+                .clicked()
+            {
+                self.timeline.fit();
             }
         });
+        ui.add_enabled_ui(has_media && !deepest, |ui| {
+            if theme::icon_button(ui, Icon::ZoomIn, s, "Zoom in", "Zoom in (=) · Ctrl+scroll")
+                .clicked()
+            {
+                self.zoom_timeline(2.0);
+            }
+        });
+        ui.add_enabled_ui(has_media && zoomed, |ui| {
+            if theme::icon_button(
+                ui,
+                Icon::ZoomOut,
+                s,
+                "Zoom out",
+                "Zoom out (−) · Ctrl+scroll",
+            )
+            .clicked()
+            {
+                self.zoom_timeline(0.5);
+            }
+        });
+        ui.spacing_mut().item_spacing.x = 6.0;
     }
 
-    /// Progress or result of the latest export, in the status bar.
-    /// Returns false when there's nothing to show.
-    fn job_status(&mut self, ui: &mut egui::Ui) -> bool {
+    /// (`3 parts`, `· exports 11.4 s of 16.1 s`, anything exported).
+    fn part_summary(&self) -> Option<(String, String, bool)> {
+        if self.project.is_empty() {
+            return None;
+        }
+        let segs = self.project.segments();
+        if segs.is_empty() {
+            return Some(("Everything is cut out".into(), String::new(), false));
+        }
+        let parts: usize = self.project.clips.iter().map(|c| c.parts.len()).sum();
+        let noun = match self.project.mode {
+            PartMode::Keep => "part",
+            PartMode::Remove => "cut",
+        };
+        let out: f64 = segs.iter().map(|s| s.len().secs()).sum();
+        let total = self.project.total_duration().secs();
+        Some((
+            format!("{parts} {noun}{}", if parts == 1 { "" } else { "s" }),
+            format!(
+                "· exports {} of {}",
+                format::length(out),
+                format::length(total)
+            ),
+            true,
+        ))
+    }
+
+    /// Progress or result of the latest export, floating over the bottom
+    /// right of the picture.
+    fn job_card(&mut self, ctx: &egui::Context) {
         let waiting = self
             .jobs
             .iter()
@@ -1646,8 +1811,11 @@ impl CutlineApp {
                     .rposition(|j| !j.dismissed && !matches!(j.state, JobState::Waiting))
             })
         else {
-            return false;
+            return;
         };
+        if self.viewer_rect == egui::Rect::NOTHING {
+            return;
+        }
         let mut cancel = None;
         let mut dismiss = false;
         let mut open_details = None;
@@ -1659,84 +1827,151 @@ impl CutlineApp {
                 .unwrap_or_default()
         };
         let small_btn =
-            |ui: &mut egui::Ui, text: &str| ui.add(theme::ghost(text).height(24.0)).clicked();
-        match &job.state {
-            JobState::Running {
-                fraction,
-                eta,
-                stage,
-            } => {
-                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                let mut text = format!("{stage} · {:.0}%", fraction * 100.0);
-                if let Some(e) = eta {
-                    text.push_str(&format!(" · {}", format::time_left(*e)));
-                }
-                ui.label(egui::RichText::new(text).size(12.0).color(theme::TEXT));
-                progress_bar(ui, *fraction as f32, 160.0);
-                ui.label(theme::small(
-                    job.outputs.first().map(name).unwrap_or_default(),
-                ));
-                if waiting > 0 {
-                    ui.label(theme::small(format!("· {waiting} more waiting")));
-                }
-                if small_btn(ui, "Cancel") {
-                    cancel = Some(job.id);
-                }
-            }
-            JobState::Done { outputs, .. } => {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
-                Icon::Check.paint(ui.painter(), r, theme::SUCCESS);
-                let bytes: u64 = outputs.iter().map(|o| o.bytes).sum();
-                ui.label(
-                    egui::RichText::new(format!("Saved · {}", format::size(bytes)))
-                        .size(12.0)
-                        .color(theme::TEXT),
-                );
-                let label = if outputs.len() == 1 {
-                    name(&outputs[0].path)
-                } else {
-                    format!("{} videos", outputs.len())
-                };
-                ui.label(theme::small(label));
-                if small_btn(ui, "Show in folder") {
-                    show = outputs.first().map(|o| o.path.clone());
-                }
-                if small_btn(ui, "Details") {
-                    open_details = Some(job.id);
-                }
-                if small_btn(ui, "Dismiss") {
-                    dismiss = true;
-                }
-            }
-            JobState::Failed { message } => {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
-                Icon::Close.paint(ui.painter(), r, theme::DANGER);
-                ui.label(
-                    egui::RichText::new("Couldn't save")
-                        .size(12.0)
-                        .color(theme::DANGER),
-                );
-                ui.add(egui::Label::new(theme::small(message.clone())).truncate());
-                if small_btn(ui, "Details") {
-                    open_details = Some(job.id);
-                }
-                if small_btn(ui, "Dismiss") {
-                    dismiss = true;
-                }
-            }
-            JobState::Canceled => {
-                ui.label(
-                    egui::RichText::new("Canceled")
-                        .size(12.0)
-                        .color(theme::TEXT),
-                );
-                ui.label(theme::small("Nothing was saved."));
-                if small_btn(ui, "Dismiss") {
-                    dismiss = true;
-                }
-            }
-            JobState::Waiting => {}
-        }
+            |ui: &mut egui::Ui, text: &str| ui.add(theme::ghost(text).height(26.0)).clicked();
+        egui::Area::new(egui::Id::unique("job-card"))
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .fixed_pos(self.viewer_rect.right_bottom() - egui::vec2(12.0, 12.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 6,
+                        top: 6,
+                        bottom: 6,
+                    })
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(110),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width((self.viewer_rect.width() - 24.0).max(200.0));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            match &job.state {
+                                JobState::Running {
+                                    fraction,
+                                    eta,
+                                    stage,
+                                } => {
+                                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                                    let mut text = format!("{stage} · {:.0}%", fraction * 100.0);
+                                    if let Some(e) = eta {
+                                        text.push_str(&format!(" · {}", format::time_left(*e)));
+                                    }
+                                    ui.label(egui::RichText::new(text).size(12.5));
+                                    theme::progress_bar(ui, *fraction as f32, 120.0);
+                                    ui.add(
+                                        egui::Label::new(theme::small(
+                                            job.outputs.first().map(name).unwrap_or_default(),
+                                        ))
+                                        .truncate(),
+                                    );
+                                    if waiting > 0 {
+                                        ui.label(theme::small(format!("· {waiting} more waiting")));
+                                    }
+                                    if ui
+                                        .add(
+                                            theme::ghost("Cancel")
+                                                .label("Cancel export")
+                                                .height(26.0),
+                                        )
+                                        .clicked()
+                                    {
+                                        cancel = Some(job.id);
+                                    }
+                                }
+                                JobState::Done { outputs, .. } => {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        Sense::hover(),
+                                    );
+                                    Icon::Check.paint(ui.painter(), r, theme::SUCCESS);
+                                    let bytes: u64 = outputs.iter().map(|o| o.bytes).sum();
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Saved · {}",
+                                            format::size(bytes)
+                                        ))
+                                        .size(12.5),
+                                    );
+                                    let label = if outputs.len() == 1 {
+                                        name(&outputs[0].path)
+                                    } else {
+                                        format!("{} videos", outputs.len())
+                                    };
+                                    ui.add(egui::Label::new(theme::small(label)).truncate());
+                                    if small_btn(ui, "Show in folder") {
+                                        show = outputs.first().map(|o| o.path.clone());
+                                    }
+                                    if small_btn(ui, "Details") {
+                                        open_details = Some(job.id);
+                                    }
+                                    if theme::icon_button(
+                                        ui,
+                                        Icon::Close,
+                                        egui::vec2(26.0, 26.0),
+                                        "Dismiss",
+                                        "Dismiss",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                }
+                                JobState::Failed { message } => {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        Sense::hover(),
+                                    );
+                                    Icon::Close.paint(ui.painter(), r, theme::DANGER);
+                                    ui.label(
+                                        egui::RichText::new("Couldn't save")
+                                            .size(12.5)
+                                            .color(theme::DANGER),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(theme::small(message.clone())).truncate(),
+                                    );
+                                    if small_btn(ui, "Details") {
+                                        open_details = Some(job.id);
+                                    }
+                                    if theme::icon_button(
+                                        ui,
+                                        Icon::Close,
+                                        egui::vec2(26.0, 26.0),
+                                        "Dismiss",
+                                        "Dismiss",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                }
+                                JobState::Canceled => {
+                                    ui.label(egui::RichText::new("Canceled").size(12.5));
+                                    ui.label(theme::small("Nothing was saved."));
+                                    if theme::icon_button(
+                                        ui,
+                                        Icon::Close,
+                                        egui::vec2(26.0, 26.0),
+                                        "Dismiss",
+                                        "Dismiss",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                }
+                                JobState::Waiting => {}
+                            }
+                        });
+                    });
+            });
         if let Some(id) = cancel {
             if let Some(e) = &self.engine {
                 e.cancel(id);
@@ -1746,12 +1981,13 @@ impl CutlineApp {
             self.jobs[idx].dismissed = true;
         }
         if let Some(id) = open_details {
-            self.details = Some(DetailsWindow { job: id });
+            if !self.has_dialog(Kind::Details) {
+                self.push_dialog(Dialog::Details(id));
+            }
         }
         if let Some(p) = show {
             show_in_folder(&p);
         }
-        true
     }
 
     fn drop_overlay(&mut self, ctx: &egui::Context) {
@@ -1807,7 +2043,7 @@ impl CutlineApp {
             Icon::Plus.paint(
                 &painter,
                 egui::Rect::from_center_size(c - egui::vec2(0.0, 44.0), egui::vec2(26.0, 26.0)),
-                Color32::WHITE,
+                theme::ON_ACCENT,
             );
             let text = if self.project.is_empty() {
                 "Drop to open"
@@ -1819,7 +2055,7 @@ impl CutlineApp {
                 egui::Align2::CENTER_CENTER,
                 text,
                 egui::FontId::new(20.0, theme::semibold_family()),
-                theme::TEXT,
+                TEXT,
             );
         }
     }
@@ -1834,6 +2070,7 @@ impl CutlineApp {
         egui::Area::new(egui::Id::unique("toast"))
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, HEADER_H + 14.0))
             .order(egui::Order::Tooltip)
+            .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(theme::RAISED)
@@ -1851,97 +2088,105 @@ impl CutlineApp {
                         ui.horizontal(|ui| {
                             let (r, _) =
                                 ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
-                            Icon::Info.paint(ui.painter(), r, theme::ACCENT_HOVER);
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(text).color(theme::TEXT),
-                            ));
+                            Icon::Info.paint(ui.painter(), r, theme::ACCENT);
+                            ui.add(egui::Label::new(egui::RichText::new(text).color(TEXT)));
                         });
                     });
             });
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
-    fn path_prompt_ui(&mut self, ctx: &egui::Context) {
-        let Some(text) = &mut self.path_prompt else {
-            return;
-        };
-        let mut open = None;
-        let mut close = false;
-        egui::Modal::new(egui::Id::unique("path-prompt"))
-            .frame(theme::dialog_frame().inner_margin(20))
-            .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.heading("Open a video");
-                ui.label(theme::small("Type or paste the path of a video file."));
-                let r = ui.add(
-                    egui::TextEdit::singleline(text)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("/home/you/Videos/clip.mp4"),
-                );
-                r.request_focus();
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(theme::primary("Open")).clicked()
-                            || ui.input(|i| i.key_pressed(Key::Enter))
-                        {
-                            open = Some(PathBuf::from(text.trim()));
-                        }
-                        if ui.add(theme::secondary("Cancel")).clicked()
-                            || ui.input(|i| i.key_pressed(Key::Escape))
-                        {
-                            close = true;
-                        }
-                    });
-                });
-            });
-        if let Some(p) = open {
-            self.path_prompt = None;
-            let p = shellexpand_home(&p);
-            if p.is_file() {
-                self.add_files(vec![p]);
-            } else {
-                self.toast("There's no file at that path.".into());
-            }
-        } else if close {
-            self.path_prompt = None;
-        }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn toast_text(&self) -> Option<&str> {
+        self.toast.as_ref().map(|t| t.text.as_str())
     }
 
     fn quit_guard(&mut self, ctx: &egui::Context) {
         let busy = self.engine.as_ref().map(|e| e.busy()).unwrap_or(false);
         if ctx.input(|i| i.viewport().close_requested()) {
-            if busy && !self.confirm_quit {
+            if busy && !self.quitting {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.confirm_quit = true;
+                if !self.has_dialog(Kind::ConfirmQuit) {
+                    self.push_dialog(Dialog::ConfirmQuit);
+                }
             } else {
                 self.save_session_if_changed(true);
             }
         }
-        if self.confirm_quit {
-            egui::Modal::new(egui::Id::unique("quit"))
-                .frame(theme::dialog_frame().inner_margin(20))
-                .show(ctx, |ui| {
-                    ui.set_width(380.0);
-                    ui.heading("Still saving");
-                    ui.label("If you quit now, the export stops and nothing is saved.");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(theme::primary("Keep saving")).clicked() {
-                                self.confirm_quit = false;
-                            }
-                            if ui.add(theme::secondary("Quit anyway")).clicked() {
-                                if let Some(e) = &self.engine {
-                                    e.cancel_all();
-                                }
-                                self.save_session_if_changed(true);
-                                // Give the worker a moment to kill ffmpeg and clean up.
-                                std::thread::sleep(Duration::from_millis(300));
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                        });
-                    });
-                });
+    }
+
+    /// Without the system's title bar, the window's edges resize it.
+    fn resize_edges(&self, ui: &mut egui::Ui) {
+        use egui::viewport::ResizeDirection as D;
+        use egui::CursorIcon as C;
+        let ctx = ui.ctx().clone();
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if !self.csd || maximized {
+            return;
+        }
+        let r = ctx.content_rect();
+        let (m, k) = (5.0, 14.0);
+        let zones = [
+            (
+                egui::Rect::from_min_max(r.min, r.min + egui::vec2(k, k)),
+                D::NorthWest,
+                C::ResizeNorthWest,
+            ),
+            (
+                egui::Rect::from_min_max(
+                    egui::pos2(r.max.x - k, r.min.y),
+                    egui::pos2(r.max.x, r.min.y + k),
+                ),
+                D::NorthEast,
+                C::ResizeNorthEast,
+            ),
+            (
+                egui::Rect::from_min_max(
+                    egui::pos2(r.min.x, r.max.y - k),
+                    egui::pos2(r.min.x + k, r.max.y),
+                ),
+                D::SouthWest,
+                C::ResizeSouthWest,
+            ),
+            (
+                egui::Rect::from_min_max(r.max - egui::vec2(k, k), r.max),
+                D::SouthEast,
+                C::ResizeSouthEast,
+            ),
+            (
+                egui::Rect::from_min_max(r.min, egui::pos2(r.max.x, r.min.y + m)),
+                D::North,
+                C::ResizeNorth,
+            ),
+            (
+                egui::Rect::from_min_max(egui::pos2(r.min.x, r.max.y - m), r.max),
+                D::South,
+                C::ResizeSouth,
+            ),
+            (
+                egui::Rect::from_min_max(r.min, egui::pos2(r.min.x + m, r.max.y)),
+                D::West,
+                C::ResizeWest,
+            ),
+            (
+                egui::Rect::from_min_max(egui::pos2(r.max.x - m, r.min.y), r.max),
+                D::East,
+                C::ResizeEast,
+            ),
+        ];
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let Some(pos) = ctx.pointer_hover_pos() else {
+            return;
+        };
+        // Corners first: they overlap the edges.
+        for (zone, dir, cursor) in zones {
+            if zone.contains(pos) {
+                ctx.set_cursor_icon(cursor);
+                if pressed {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                }
+                return;
+            }
         }
     }
 
@@ -1950,113 +2195,9 @@ impl CutlineApp {
             .clip(clip)
             .and_then(|c| self.sources.get(&c.path))
     }
-}
 
-/// `HH:MM:SS:FF` at the clip's frame rate.
-fn timecode(secs: f64, fps: f64) -> String {
-    let s = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
-    let fps_i = fps.round().max(1.0) as u64;
-    let total_frames = (s * fps).round() as u64;
-    let f = total_frames % fps_i;
-    let whole = total_frames / fps_i;
-    // Pad the frame field to the widest frame number at this rate (`119` at
-    // 120 fps), so the readout keeps one width while it plays.
-    let fw = (fps_i - 1).max(10).to_string().len();
-    format!(
-        "{:02}:{:02}:{:02}:{:0fw$}",
-        whole / 3600,
-        (whole / 60) % 60,
-        whole % 60,
-        f
-    )
-}
-
-fn trim_fps(fps: f64) -> String {
-    let r = (fps * 100.0).round() / 100.0;
-    if r.fract() == 0.0 {
-        format!("{r:.0}")
-    } else {
-        format!("{r}")
-    }
-}
-
-fn codec_name(codec: &str) -> String {
-    match codec {
-        "hevc" => "H.265".into(),
-        "h264" => "H.264".into(),
-        "av1" => "AV1".into(),
-        "vp9" => "VP9".into(),
-        "vp8" => "VP8".into(),
-        "mpeg4" => "MPEG-4".into(),
-        "prores" => "ProRes".into(),
-        other => other.to_uppercase(),
-    }
-}
-
-/// A key drawn as a little keycap, for the shortcut hints.
-fn keycap(ui: &mut egui::Ui, key: &str) {
-    let g = ui.painter().layout_no_wrap(
-        key.to_string(),
-        egui::FontId::proportional(10.5),
-        theme::MUTED,
-    );
-    let size = egui::vec2((g.size().x + 10.0).max(18.0), 18.0);
-    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(
-        r,
-        4,
-        theme::RAISED,
-        Stroke::new(1.0, theme::BORDER),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter()
-        .galley(r.center() - g.size() / 2.0, g, theme::MUTED);
-}
-
-fn progress_bar(ui: &mut egui::Ui, fraction: f32, width: f32) {
-    let (r, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), Sense::hover());
-    ui.painter().rect_filled(r, 3, theme::HOVER);
-    let mut f = r;
-    f.set_width(width * fraction.clamp(0.0, 1.0));
-    ui.painter().rect_filled(f, 3, theme::ACCENT);
-}
-
-fn shellexpand_home(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(h) = std::env::var_os("HOME") {
-            return PathBuf::from(h).join(rest);
-        }
-    }
-    p.to_path_buf()
-}
-
-/// Sort `clip 2` before `clip 10` when several files are dropped at once.
-fn natural_key(p: &Path) -> Vec<(String, u64)> {
-    let s = p
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let mut out = vec![];
-    let mut text = String::new();
-    let mut num = String::new();
-    for ch in s.chars() {
-        if ch.is_ascii_digit() {
-            num.push(ch);
-        } else {
-            if !num.is_empty() {
-                out.push((std::mem::take(&mut text), num.parse().unwrap_or(0)));
-                num.clear();
-            }
-            text.push(ch);
-        }
-    }
-    out.push((text, num.parse().unwrap_or(0)));
-    out
-}
-
-impl eframe::App for CutlineApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// One frame of the whole window.
+    pub fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_probes();
         self.handle_engine();
@@ -2090,85 +2231,54 @@ impl eframe::App for CutlineApp {
             .frame(
                 egui::Frame::new()
                     .fill(theme::PANEL)
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 8,
+                        top: 0,
+                        bottom: 0,
+                    }),
             )
             .show(ui, |ui| self.header(ui));
-        egui::Panel::bottom("status")
-            .exact_size(STATUS_H)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(egui::Margin::symmetric(14, 0)),
-            )
-            .show(ui, |ui| self.status_bar(ui));
-        egui::Panel::bottom("editor")
+        egui::Panel::bottom("timeline")
             .frame(
                 egui::Frame::new()
                     .fill(theme::PANEL)
                     .inner_margin(egui::Margin {
-                        left: 14,
-                        right: 14,
-                        top: 10,
-                        bottom: 12,
+                        left: 20,
+                        right: 20,
+                        top: 12,
+                        // The scroll bar's row under the labels fills the rest.
+                        bottom: 2,
                     }),
             )
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.0;
                 self.edit_toolbar(ui);
-                ui.add_space(4.0);
                 let action = timeline::show(ui, self);
                 self.timeline_action(action);
             });
+        egui::Panel::bottom("transport")
+            .exact_size(TRANSPORT_H)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(20, 0)),
+            )
+            .show(ui, |ui| self.transport(ui));
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG)
-                    .inner_margin(egui::Margin {
-                        left: 14,
-                        right: 14,
-                        top: 14,
-                        bottom: 0,
-                    }),
+                    .fill(theme::VIEWER)
+                    .inner_margin(egui::Margin::ZERO),
             )
-            .show(ui, |ui| {
-                // No item spacing here: the transport row's own height is the
-                // gap, so the play button sits centred between the viewer and
-                // the editor panel instead of spilling into it.
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let h = (ui.available_height() - TRANSPORT_H).max(120.0);
-                self.viewer(ui, h);
-                self.transport(ui);
-            });
+            .show(ui, |ui| self.viewer(ui));
 
-        // Windows and dialogs on top.
-        if let Some(mut d) = self.export.take() {
-            match d.show(&ctx, self) {
-                ExportOutcome::Open => self.export = Some(d),
-                ExportOutcome::Closed => {}
-                ExportOutcome::Advanced => {
-                    self.advanced = Some(AdvancedEditor::new(self, d.preset_id()));
-                    self.export = Some(d);
-                }
-            }
-        }
-        if let Some(mut a) = self.advanced.take() {
-            if let Some(use_id) = a.show(&ctx, self) {
-                if let Some(d) = &mut self.export {
-                    d.use_preset(&use_id);
-                }
-            }
-            if a.open {
-                self.advanced = Some(a);
-            }
-        }
-        if let Some(d) = self.details.take() {
-            if d.show(&ctx, self) {
-                self.details = Some(d);
-            }
-        }
-        self.path_prompt_ui(&ctx);
+        self.job_card(&ctx);
+        self.show_dialogs(&ctx);
         self.toast_ui(&ctx);
         self.drop_overlay(&ctx);
         self.quit_guard(&ctx);
+        self.resize_edges(ui);
         self.save_session_if_changed(false);
 
         if self.playing()
@@ -2181,15 +2291,6 @@ impl eframe::App for CutlineApp {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_session_if_changed(true);
-        if let Some(e) = &self.engine {
-            e.cancel_all();
-        }
-    }
-}
-
-impl CutlineApp {
     fn timeline_action(&mut self, action: TimelineAction) {
         match action {
             TimelineAction::None => {}
@@ -2221,7 +2322,26 @@ impl CutlineApp {
                 }
                 self.resume_after_drag = None;
             }
-            TimelineAction::Checkpoint => self.checkpoint(),
+            TimelineAction::AddPart(c, t) => {
+                self.checkpoint();
+                if self.project.add_part(c, t).is_none() {
+                    self.undo.pop();
+                }
+            }
+            TimelineAction::SplitAt(c, t) => {
+                self.checkpoint();
+                if self.project.split_part(c, t).is_none() {
+                    self.undo.pop();
+                }
+            }
+            TimelineAction::RemovePart(r) => {
+                self.checkpoint();
+                self.project.remove_part(r);
+            }
+            TimelineAction::SetMode(m) => {
+                self.checkpoint();
+                self.project.set_mode(m);
+            }
             TimelineAction::RemoveClip(c) => {
                 self.checkpoint();
                 let was_loaded = self.loaded == Some(c);
@@ -2251,21 +2371,126 @@ impl CutlineApp {
     }
 }
 
+/// A round window button in the title bar; Close turns red on hover.
+fn window_button(ui: &mut egui::Ui, icon: Icon, label: &str, close: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, label));
+    let hovered = resp.hovered();
+    let (fill, fg) = match (close, hovered) {
+        (true, true) => (theme::DANGER, theme::ON_ACCENT),
+        (true, false) => (theme::HOVER, TEXT),
+        (false, true) => (theme::HOVER, TEXT),
+        (false, false) => (Color32::TRANSPARENT, MUTED),
+    };
+    let p = ui.painter();
+    p.circle_filled(r.center(), 14.0, fill);
+    icon.paint(
+        p,
+        egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 14.0)),
+        fg,
+    );
+    resp
+}
+
+/// `HH:MM:SS.mmm`: one width at every frame rate.
+fn clock_ms(secs: f64) -> String {
+    let s = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+    let ms = (s * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        ms / 3_600_000,
+        (ms / 60_000) % 60,
+        (ms / 1000) % 60,
+        ms % 1000
+    )
+}
+
+fn trim_fps(fps: f64) -> String {
+    let r = (fps * 100.0).round() / 100.0;
+    if r.fract() == 0.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r}")
+    }
+}
+
+fn codec_name(codec: &str) -> String {
+    match codec {
+        "hevc" => "H.265".into(),
+        "h264" => "H.264".into(),
+        "av1" => "AV1".into(),
+        "vp9" => "VP9".into(),
+        "vp8" => "VP8".into(),
+        "mpeg4" => "MPEG-4".into(),
+        "prores" => "ProRes".into(),
+        other => other.to_uppercase(),
+    }
+}
+
+/// Sort `clip 2` before `clip 10` when several files are dropped at once.
+fn natural_key(p: &Path) -> Vec<(String, u64)> {
+    let s = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut out = vec![];
+    let mut text = String::new();
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            if !num.is_empty() {
+                out.push((std::mem::take(&mut text), num.parse().unwrap_or(0)));
+                num.clear();
+            }
+            text.push(ch);
+        }
+    }
+    out.push((text, num.parse().unwrap_or(0)));
+    out
+}
+
+impl eframe::App for CutlineApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session_if_changed(true);
+        if let Some(e) = &self.engine {
+            e.cancel_all();
+        }
+    }
+}
+
+#[cfg(test)]
+impl CutlineApp {
+    /// Put a video on the timeline as if it had been probed, without ffprobe.
+    pub fn add_probed_for_tests(&mut self, info: MediaInfo) -> u64 {
+        let path = info.path.clone();
+        let fps = info.video.as_ref().map(|v| v.fps).unwrap_or(0.0);
+        let dur = Timestamp::from_secs(info.duration);
+        self.sources.insert(path.clone(), info);
+        let was_empty = self.project.is_empty();
+        let id = self.project.add_clip(path, dur, fps);
+        if was_empty {
+            self.load_clip(id, Timestamp::ZERO, false);
+        }
+        id
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn timecode_counts_frames() {
-        assert_eq!(timecode(0.0, 30.0), "00:00:00:00");
-        assert_eq!(timecode(4.1, 30.0), "00:00:04:03");
-        assert_eq!(timecode(3725.48, 25.0), "01:02:05:12");
-        // 29.97 fps counts 30 frame numbers per second.
-        assert_eq!(timecode(0.95, 29.97), "00:00:00:28");
-        assert_eq!(timecode(f64::NAN, 30.0), "00:00:00:00");
-        // High frame rates keep a fixed-width frame field.
-        assert_eq!(timecode(0.25, 120.0), "00:00:00:030");
-        assert_eq!(timecode(0.9, 120.0), "00:00:00:108");
+    fn clock_keeps_one_width() {
+        assert_eq!(clock_ms(0.0), "00:00:00.000");
+        assert_eq!(clock_ms(6.832), "00:00:06.832");
+        assert_eq!(clock_ms(3725.48), "01:02:05.480");
+        assert_eq!(clock_ms(f64::NAN), "00:00:00.000");
     }
 
     #[test]

@@ -13,8 +13,6 @@ pub enum Icon {
     Pause,
     StepBack,
     StepForward,
-    ToStart,
-    ToEnd,
     /// Speaker with 0–2 waves.
     Volume(u8),
     Muted,
@@ -25,6 +23,18 @@ pub enum Icon {
     Folder,
     Info,
     Sliders,
+    Scissors,
+    Trash,
+    Minimize,
+    Maximize,
+    /// Two overlapping squares: the window is maximized.
+    Restore,
+    ChevronDown,
+    ArrowLeft,
+    ArrowRight,
+    Pencil,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl Icon {
@@ -106,24 +116,6 @@ impl Icon {
                 );
                 p.add(poly(vec![at(3.0, 3.5), at(9.5, 8.0), at(3.0, 12.5)]));
             }
-            Icon::ToStart => {
-                p.rect_filled(
-                    Rect::from_min_size(at(2.0, 3.5), vec2(2.0, 9.0) * s),
-                    0.8 * s,
-                    color,
-                );
-                p.add(poly(vec![at(9.0, 3.5), at(9.0, 12.5), at(4.5, 8.0)]));
-                p.add(poly(vec![at(14.0, 3.5), at(14.0, 12.5), at(9.5, 8.0)]));
-            }
-            Icon::ToEnd => {
-                p.rect_filled(
-                    Rect::from_min_size(at(12.0, 3.5), vec2(2.0, 9.0) * s),
-                    0.8 * s,
-                    color,
-                );
-                p.add(poly(vec![at(2.0, 3.5), at(6.5, 8.0), at(2.0, 12.5)]));
-                p.add(poly(vec![at(7.0, 3.5), at(11.5, 8.0), at(7.0, 12.5)]));
-            }
             Icon::Volume(_) | Icon::Muted => {
                 p.add(poly(vec![
                     at(1.5, 5.5),
@@ -190,43 +182,90 @@ impl Icon {
                     p.circle_filled(at(x, y), 2.0 * s, color);
                 }
             }
+            Icon::Scissors => {
+                p.circle_stroke(at(4.0, 4.0), 2.2 * s, line);
+                p.circle_stroke(at(4.0, 12.0), 2.2 * s, line);
+                p.add(path(vec![at(5.6, 10.4), at(13.5, 2.5)]));
+                p.add(path(vec![at(5.6, 5.6), at(8.2, 8.2)]));
+                p.add(path(vec![at(9.8, 9.8), at(13.5, 13.5)]));
+            }
+            Icon::Trash => {
+                p.add(path(vec![at(2.0, 4.0), at(14.0, 4.0)]));
+                p.add(path(vec![
+                    at(5.5, 4.0),
+                    at(5.5, 2.5),
+                    at(10.5, 2.5),
+                    at(10.5, 4.0),
+                ]));
+                p.add(path(vec![
+                    at(3.5, 4.0),
+                    at(4.3, 13.5),
+                    at(11.7, 13.5),
+                    at(12.5, 4.0),
+                ]));
+            }
+            Icon::Minimize => {
+                p.add(path(vec![at(3.5, 8.0), at(12.5, 8.0)]));
+            }
+            Icon::Maximize => {
+                let r = Rect::from_min_max(at(3.5, 3.5), at(12.5, 12.5));
+                p.rect_stroke(r, 1.5 * s, line, egui::StrokeKind::Middle);
+            }
+            Icon::Restore => {
+                let r = Rect::from_min_max(at(3.0, 5.5), at(10.5, 13.0));
+                p.rect_stroke(r, 1.2 * s, line, egui::StrokeKind::Middle);
+                p.add(path(vec![at(5.5, 3.0), at(13.0, 3.0), at(13.0, 10.5)]));
+            }
+            Icon::ChevronDown => {
+                p.add(path(vec![at(4.0, 6.0), at(8.0, 10.0), at(12.0, 6.0)]));
+            }
+            Icon::ArrowLeft | Icon::ArrowRight => {
+                let fx = |x: f32| {
+                    if self == Icon::ArrowRight {
+                        16.0 - x
+                    } else {
+                        x
+                    }
+                };
+                p.add(path(vec![at(fx(13.0), 8.0), at(fx(3.0), 8.0)]));
+                p.add(path(vec![
+                    at(fx(7.0), 4.0),
+                    at(fx(3.0), 8.0),
+                    at(fx(7.0), 12.0),
+                ]));
+            }
+            Icon::ZoomIn | Icon::ZoomOut => {
+                p.circle_stroke(at(7.0, 7.0), 4.8 * s, line);
+                p.add(path(vec![at(10.6, 10.6), at(14.0, 14.0)]));
+                p.add(path(vec![at(4.8, 7.0), at(9.2, 7.0)]));
+                if self == Icon::ZoomIn {
+                    p.add(path(vec![at(7.0, 4.8), at(7.0, 9.2)]));
+                }
+            }
+            Icon::Pencil => {
+                p.add(path(vec![
+                    at(10.5, 2.5),
+                    at(13.5, 5.5),
+                    at(5.5, 13.5),
+                    at(2.5, 13.5),
+                    at(2.5, 10.5),
+                    at(10.5, 2.5),
+                ]));
+                p.add(path(vec![at(8.8, 4.2), at(11.8, 7.2)]));
+            }
         }
     }
 }
 
-/// The app mark: two amber trim brackets around a white play triangle.
-pub fn logo(p: &Painter, rect: Rect) {
-    p.rect_filled(rect, rect.width() * 0.26, crate::theme::RAISED);
-    p.rect_stroke(
-        rect,
-        rect.width() * 0.26,
-        Stroke::new(1.0, crate::theme::BORDER),
-        egui::StrokeKind::Inside,
-    );
-    let s = rect.width() / 24.0;
-    let o = rect.min;
-    let at = |x: f32, y: f32| o + vec2(x, y) * s;
-    let trim = Stroke::new(2.2 * s, crate::theme::TRIM);
-    p.add(Shape::line(
-        vec![at(8.0, 5.5), at(5.5, 5.5), at(5.5, 18.5), at(8.0, 18.5)],
-        trim,
-    ));
-    p.add(Shape::line(
-        vec![at(16.0, 5.5), at(18.5, 5.5), at(18.5, 18.5), at(16.0, 18.5)],
-        trim,
-    ));
-    p.add(Shape::convex_polygon(
-        vec![at(10.0, 8.5), at(15.0, 12.0), at(10.0, 15.5)],
-        Color32::WHITE,
-        Stroke::NONE,
-    ));
-}
+// The app mark keeps its own colours, whatever the UI palette is.
+const LOGO_BG: Color32 = Color32::from_rgb(0x1e, 0x20, 0x25);
+const LOGO_BORDER: Color32 = Color32::from_rgb(0x32, 0x35, 0x3d);
+const LOGO_TRIM: Color32 = Color32::from_rgb(0xf5, 0xb8, 0x3d);
 
-/// [`logo`] as a window icon, rasterised in software (4×4 samples a pixel)
+/// The app mark (two amber trim brackets around a white play triangle) as a window icon, rasterised in software (4×4 samples a pixel)
 /// since there's no GPU before the window exists. Shown by X11 window
 /// managers; Wayland compositors take the icon from the desktop file.
 pub fn window_icon(size: u32) -> egui::IconData {
-    use crate::theme::{BORDER, RAISED, TRIM};
     // In the logo's 24-unit space.
     let radius = 24.0 * 0.26;
     let in_rounded = |x: f32, y: f32, inset: f32| {
@@ -279,11 +318,11 @@ pub fn window_icon(size: u32) -> egui::IconData {
                     let c = if in_play(x, y) {
                         Color32::WHITE
                     } else if in_trim(x, y) {
-                        TRIM
+                        LOGO_TRIM
                     } else if !in_rounded(x, y, border_w) {
-                        BORDER
+                        LOGO_BORDER
                     } else {
-                        RAISED
+                        LOGO_BG
                     };
                     acc[0] += c.r() as f32;
                     acc[1] += c.g() as f32;

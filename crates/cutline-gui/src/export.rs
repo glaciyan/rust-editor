@@ -1,33 +1,26 @@
-//! The export dialog: three plain choices, then Save. Only megabytes and
-//! minutes are shown; codecs and the like live in Advanced….
+//! The export dialog: one list of profiles (the built-in ones, then yours),
+//! each with how big it comes out and how long it takes, then a name and a
+//! folder. Codecs only show up in New profile….
 
 use crate::app::CutlineApp;
 use crate::icons::Icon;
-use crate::theme::{self, ACCENT, ACCENT_SOFT, BORDER, MUTED};
-use cutline_core::{format, Profile, Quality, RateControl};
-use cutline_engine::estimate::{self, calibration_key, FitEstimate};
+use crate::modal::{self, Dialog, Outcome};
+use crate::profile::ProfileDialog;
+use crate::theme::{self, ACCENT, BORDER, MUTED};
+use cutline_core::{format, Profile, Quality, RateControl, FIT_ID, ORIGINAL_ID};
+use cutline_engine::estimate::{self, calibration_key, Estimate, FitEstimate};
 use cutline_engine::request::{default_name, free_name, ExportRequest};
-use eframe::egui::{self, Key, Stroke};
+use eframe::egui::{self, Color32, Role, Sense, Stroke, WidgetInfo};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Choice {
-    Original,
-    Fit,
-    Preset,
-}
-
-pub enum ExportOutcome {
-    Open,
-    Closed,
-    Advanced,
-}
+/// Width of the Choose… button, so Save to lines up with Name.
+const CHOOSE_W: f32 = 100.0;
 
 pub struct ExportDialog {
-    choice: Choice,
+    /// The picked row: `original`, `fit`, or a preset's id.
+    picked: String,
     fit_text: String,
-    preset_id: String,
     name: String,
     folder: String,
     separate: bool,
@@ -35,17 +28,22 @@ pub struct ExportDialog {
     conflict: Option<Vec<PathBuf>>,
     folder_rx: Option<Receiver<Option<PathBuf>>>,
     error: Option<String>,
-    focus_once: bool,
 }
 
-const SIZE_CHIPS: [u32; 4] = [8, 10, 25, 50];
+/// What a row shows on its right.
+enum RowInfo {
+    Estimate(Estimate),
+    Fit(Option<FitEstimate>, f64),
+}
 
 impl ExportDialog {
     pub fn new(app: &CutlineApp) -> Self {
         let first = &app.project.clips[0].path;
-        let folder = first
-            .parent()
-            .map(|p| p.to_path_buf())
+        let folder = app
+            .last_export_dir
+            .clone()
+            .filter(|d| d.is_dir())
+            .or_else(|| first.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
         let tracks = app.sources.get(first).map(|m| m.audio.len()).unwrap_or(0);
         let original_mb = {
@@ -60,9 +58,8 @@ impl ExportDialog {
             (original_mb / 2.0).round().max(1.0)
         });
         ExportDialog {
-            choice: Choice::Original,
+            picked: ORIGINAL_ID.into(),
             fit_text: trim_num(fit),
-            preset_id: "smaller".into(),
             name: default_name(first),
             folder: folder.to_string_lossy().into_owned(),
             separate: false,
@@ -70,17 +67,18 @@ impl ExportDialog {
             conflict: None,
             folder_rx: None,
             error: None,
-            focus_once: true,
         }
     }
 
-    pub fn preset_id(&self) -> Option<String> {
-        (self.choice == Choice::Preset).then(|| self.preset_id.clone())
+    /// Pick a row (a profile just made in New profile…).
+    pub fn select(&mut self, id: &str) {
+        self.picked = id.to_string();
+        self.conflict = None;
     }
 
-    pub fn use_preset(&mut self, id: &str) {
-        self.preset_id = id.to_string();
-        self.choice = Choice::Preset;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn picked(&self) -> &str {
+        &self.picked
     }
 
     fn fit_mb(&self) -> Option<f64> {
@@ -112,29 +110,21 @@ impl ExportDialog {
         }
     }
 
-    fn preset(&self, app: &CutlineApp) -> Profile {
-        let all = app.profiles.presets();
-        all.iter()
-            .find(|p| p.id == self.preset_id)
-            .cloned()
-            .unwrap_or_else(|| all[0].clone())
-    }
-
-    /// The profile Save will use, or None if it can't (e.g. size too small).
+    /// The profile Export will use, or None if it can't (e.g. size too small).
     fn chosen_profile(&self, app: &CutlineApp, fit: &Option<FitEstimate>) -> Option<Profile> {
-        match self.choice {
-            Choice::Original => Some(Profile::original()),
-            Choice::Fit => match fit {
+        match self.picked.as_str() {
+            ORIGINAL_ID => Some(Profile::original()),
+            FIT_ID => match fit {
                 Some(FitEstimate::Original(_)) => Some(Profile::original()),
                 Some(FitEstimate::Encode(_)) => Some(Profile::fit(self.fit_mb()?)),
                 _ => None,
             },
-            Choice::Preset => Some(self.preset(app)),
+            id => app.profiles.presets().into_iter().find(|p| p.id == id),
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, app: &mut CutlineApp) -> ExportOutcome {
-        let mut outcome = ExportOutcome::Open;
+    pub fn show(&mut self, ctx: &egui::Context, app: &mut CutlineApp, enter: bool) -> Outcome {
+        let mut outcome = Outcome::Stay;
         if let Some(rx) = &self.folder_rx {
             if let Ok(r) = rx.try_recv() {
                 if let Some(p) = r {
@@ -145,22 +135,28 @@ impl ExportDialog {
             }
         }
         let Some(tools) = app.tools.clone() else {
-            return ExportOutcome::Closed;
+            return Outcome::Close;
         };
         let caps = &tools.caps;
         let segments = app.project.segments();
         let total: f64 = segments.iter().map(|s| s.len().secs()).sum();
+        // A deleted profile can't stay picked.
+        let presets = app.profiles.presets();
+        if self.picked != ORIGINAL_ID
+            && self.picked != FIT_ID
+            && !presets.iter().any(|p| p.id == self.picked)
+        {
+            self.picked = ORIGINAL_ID.into();
+        }
 
-        // Estimates (cheap; recomputed every frame so typing a size is live).
+        // Estimates for every row (cheap; recomputed every frame so typing a size is live).
         let orig_req = self.request(app, Profile::original());
         let orig_possible = cutline_engine::plan::copy_possible(&orig_req, &app.sources, caps);
+        let orig_key = calibration_key(&orig_req);
         let orig_cal = if orig_possible {
             None
         } else {
-            app.calibrations
-                .get(&calibration_key(&orig_req))
-                .copied()
-                .flatten()
+            app.calibrations.get(&orig_key).copied().flatten()
         };
         let orig = estimate::original(&orig_req, &app.sources, caps, orig_cal);
         let fit_mb = self.fit_mb();
@@ -170,29 +166,59 @@ impl ExportDialog {
             let cal = fit_key.and_then(|k| app.calibrations.get(&k).copied().flatten());
             estimate::fit(r, &app.sources, caps, fit_mb.unwrap_or(1.0), cal)
         });
-        let preset = self.preset(app);
-        let preset_req = self.request(app, preset.clone());
-        let preset_key = calibration_key(&preset_req);
-        let preset_est = estimate::encode(
-            &preset_req,
-            &app.sources,
-            app.calibrations.get(&preset_key).copied().flatten(),
-        );
+        let preset_rows: Vec<(Profile, RowInfo, u64, ExportRequest)> = presets
+            .iter()
+            .map(|p| {
+                let req = self.request(app, p.clone());
+                let (key, info) = match p.video.rate {
+                    RateControl::TargetSize(mb) if p.is_fit() => {
+                        let k = fit_cal_key(&req);
+                        let cal = app.calibrations.get(&k).copied().flatten();
+                        (
+                            k,
+                            RowInfo::Fit(
+                                Some(estimate::fit(&req, &app.sources, caps, mb, cal)),
+                                mb,
+                            ),
+                        )
+                    }
+                    _ => {
+                        let k = calibration_key(&req);
+                        let cal = app.calibrations.get(&k).copied().flatten();
+                        let e = if p.is_copy() {
+                            estimate::original(&req, &app.sources, caps, cal)
+                        } else {
+                            estimate::encode(&req, &app.sources, cal)
+                        };
+                        (k, RowInfo::Estimate(e))
+                    }
+                };
+                (p.clone(), info, key, req)
+            })
+            .collect();
 
-        // Calibrate only what's selected, so samples don't fight each other.
-        match self.choice {
-            Choice::Original if !orig_possible => {
-                app.request_calibration(calibration_key(&orig_req), orig_req.clone())
-            }
-            Choice::Fit => {
+        // Calibrate only what's picked, so samples don't fight each other.
+        match self.picked.as_str() {
+            ORIGINAL_ID if !orig_possible => app.request_calibration(orig_key, orig_req.clone()),
+            ORIGINAL_ID => {}
+            FIT_ID => {
                 if let (Some(k), Some(r), Some(FitEstimate::Encode(_))) =
                     (fit_key, fit_req.clone(), &fit)
                 {
                     app.request_calibration(k, r);
                 }
             }
-            Choice::Preset => app.request_calibration(preset_key, preset_req.clone()),
-            _ => {}
+            id => {
+                if let Some((_, info, key, req)) = preset_rows.iter().find(|r| r.0.id == id) {
+                    let wants = match info {
+                        RowInfo::Fit(f, _) => matches!(f, Some(FitEstimate::Encode(_))),
+                        RowInfo::Estimate(_) => true,
+                    };
+                    if wants {
+                        app.request_calibration(*key, req.clone());
+                    }
+                }
+            }
         }
 
         let first_audio: Vec<String> = app
@@ -206,214 +232,218 @@ impl ExportDialog {
                     .collect()
             })
             .unwrap_or_default();
-        let presets = app.profiles.presets();
-        let width = (ctx.content_rect().width() - 48.0).clamp(480.0, 800.0);
+        let chosen = self.chosen_profile(app, &fit);
+        let ext = {
+            let p = chosen.clone().unwrap_or_else(|| Profile::fit(1.0));
+            let req = self.request(app, p);
+            format!(".{}", req.extension(app.sources.get(&segments[0].path)))
+        };
+        let n = segments.len();
+        let subtitle = match (n, self.separate) {
+            (1, _) => format!("1 part · {}", format::length(total)),
+            (n, false) => format!("{n} parts joined · {}", format::length(total)),
+            (n, true) => format!("{n} parts as separate videos · {}", format::length(total)),
+        };
         let mut save = false;
         let mut save_mode: Option<bool> = None; // Some(true) = replace, Some(false) = keep both
+        let mut edit_profile: Option<String> = None;
+        let mut delete_profile: Option<String> = None;
 
-        let modal = egui::Modal::new(egui::Id::unique("export")).frame(theme::dialog_frame());
-        let resp = modal.show(ctx, |ui| {
-            ui.set_width(width);
-            egui::Frame::new()
-                .inner_margin(egui::Margin {
-                    left: 20,
-                    right: 20,
-                    top: 18,
-                    bottom: 0,
-                })
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (r, _) =
-                            ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
-                        ui.painter().rect_filled(r, 8, ACCENT_SOFT);
-                        Icon::Export.paint(
-                            ui.painter(),
-                            egui::Rect::from_center_size(r.center(), egui::vec2(16.0, 16.0)),
-                            theme::ACCENT_HOVER,
+        modal::modal(ctx, "export", 600.0, |ui| {
+            if modal::header(ui, "Export", Some(&subtitle)) {
+                outcome = Outcome::Close;
+            }
+            modal::body(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.0;
+                // The profile list.
+                let group = ui
+                    .vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let fit_status = fit_status(&fit);
+                        let builtin: Vec<&(Profile, RowInfo, u64, ExportRequest)> =
+                            preset_rows.iter().filter(|r| r.0.builtin).collect();
+                        let yours: Vec<&(Profile, RowInfo, u64, ExportRequest)> =
+                            preset_rows.iter().filter(|r| !r.0.builtin).collect();
+                        let last_builtin = yours.is_empty();
+                        // Original quality.
+                        let r = row(
+                            ui,
+                            RowSpec {
+                                name: "Original quality",
+                                desc: "Copies the video, re-encodes only around cuts",
+                                selected: self.picked == ORIGINAL_ID,
+                                first: true,
+                                last: false,
+                                tall: false,
+                            },
+                            |ui, r| estimate_lines(ui, r, &orig),
                         );
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(theme::strong("Export").size(16.0));
-                            let n = segments.len();
-                            ui.label(theme::small(format!(
-                                "{} part{} · {} long",
-                                n,
-                                if n == 1 { "" } else { "s" },
-                                format::length(total)
-                            )));
-                        });
-                    });
-                });
-            egui::Frame::new().inner_margin(20).show(ui, |ui| {
-                ui.label(theme::caption("Quality"));
-                ui.add_space(2.0);
-                ui.columns(3, |cols| {
-                    // Original quality
-                    self.choice = card(
-                        &mut cols[0],
-                        self.choice == Choice::Original,
-                        Choice::Original,
-                        |ui| {
-                            let mut c = self.choice;
-                            ui.radio_value(
-                                &mut c,
-                                Choice::Original,
-                                theme::strong("Original quality"),
-                            );
-                            ui.label(
-                                egui::RichText::new("Same quality as your video. Fastest.")
-                                    .size(12.0),
-                            );
-                            if let Some(n) = &orig.note {
-                                ui.label(theme::small(n.clone()));
-                            }
-                            bottom(ui, |ui| {
-                                ui.label(theme::strong(format::about_size(orig.bytes)));
-                                ui.label(theme::small(format::ready_in(orig.seconds)));
-                            });
-                            c
-                        },
-                    );
-
-                    // Fit to size
-                    self.choice = card(
-                        &mut cols[1],
-                        self.choice == Choice::Fit,
-                        Choice::Fit,
-                        |ui| {
-                            let mut c = self.choice;
-                            ui.radio_value(&mut c, Choice::Fit, theme::strong("Fit to size"));
-                            ui.horizontal(|ui| {
-                                let r = ui.add(
-                                    egui::TextEdit::singleline(&mut self.fit_text)
-                                        .desired_width(64.0)
-                                        .font(egui::FontId::proportional(16.0))
-                                        .margin(egui::vec2(8.0, 6.0)),
+                        if let Some(note) = &orig.note {
+                            r.clone().on_hover_text(note.clone());
+                        }
+                        if r.clicked() {
+                            self.picked = ORIGINAL_ID.into();
+                        }
+                        // Fit to size, with its size box.
+                        let mut focus_fit = false;
+                        let r = row(
+                            ui,
+                            RowSpec {
+                                name: "Fit to size",
+                                desc: "Best quality that stays under a size",
+                                selected: self.picked == FIT_ID,
+                                first: false,
+                                last: false,
+                                tall: true,
+                            },
+                            |ui, r| {
+                                // Size box and `MB` on top, the verdict under them.
+                                let (text, color) = fit_status;
+                                let status = ui.painter().layout_no_wrap(
+                                    text,
+                                    egui::FontId::proportional(11.5),
+                                    color,
                                 );
-                                if r.gained_focus() || r.changed() {
-                                    c = Choice::Fit;
+                                let mb = ui.painter().layout_no_wrap(
+                                    "MB".into(),
+                                    egui::FontId::proportional(12.5),
+                                    MUTED,
+                                );
+                                let field_h = 26.0;
+                                let block = field_h + 3.0 + status.size().y;
+                                let top = r.center().y - block / 2.0;
+                                let mb_x = r.right() - mb.size().x;
+                                let mb_h = mb.size().y;
+                                ui.painter().galley(
+                                    egui::pos2(mb_x, top + (field_h - mb_h) / 2.0),
+                                    mb,
+                                    MUTED,
+                                );
+                                let field = egui::Rect::from_min_size(
+                                    egui::pos2(mb_x - 6.0 - 54.0, top),
+                                    egui::vec2(54.0, field_h),
+                                );
+                                let mut child = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(field)
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
+                                let f = child.add(
+                                    theme::Field::new(&mut self.fit_text, "Target size in MB")
+                                        .width(54.0)
+                                        .height(field_h)
+                                        .right_align(),
+                                );
+                                if f.gained_focus() || f.changed() || f.clicked() {
+                                    focus_fit = true;
                                 }
-                                ui.label("MB");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                for (i, mb) in SIZE_CHIPS.iter().enumerate() {
-                                    if i > 0 {
-                                        ui.label(theme::small("·"));
+                                let sw = status.size().x;
+                                ui.painter().galley(
+                                    egui::pos2(r.right() - sw, top + field_h + 3.0),
+                                    status,
+                                    color,
+                                );
+                            },
+                        );
+                        if r.clicked() || focus_fit {
+                            self.picked = FIT_ID.into();
+                        }
+                        for (i, (p, info, _, _)) in
+                            builtin.iter().map(|r| (&r.0, &r.1, r.2, &r.3)).enumerate()
+                        {
+                            let r = row(
+                                ui,
+                                RowSpec {
+                                    name: &p.name,
+                                    desc: p.description.trim_end_matches('.'),
+                                    selected: self.picked == p.id,
+                                    first: false,
+                                    last: last_builtin && i + 1 == builtin.len(),
+                                    tall: false,
+                                },
+                                |ui, r| info_lines(ui, r, info),
+                            );
+                            if r.clicked() {
+                                self.picked = p.id.clone();
+                            }
+                        }
+                        if !yours.is_empty() {
+                            section(ui, "Yours");
+                            for (i, (p, info, _, _)) in
+                                yours.iter().map(|r| (&r.0, &r.1, r.2, &r.3)).enumerate()
+                            {
+                                let r = row(
+                                    ui,
+                                    RowSpec {
+                                        name: &p.name,
+                                        desc: &p.description,
+                                        selected: self.picked == p.id,
+                                        first: false,
+                                        last: i + 1 == yours.len(),
+                                        tall: false,
+                                    },
+                                    |ui, r| info_lines(ui, r, info),
+                                );
+                                if r.clicked() {
+                                    self.picked = p.id.clone();
+                                }
+                                r.context_menu(|ui| {
+                                    theme::menu(ui);
+                                    if theme::menu_item(ui, Icon::Pencil, "Edit…", None).clicked()
+                                    {
+                                        edit_profile = Some(p.id.clone());
+                                        ui.close();
                                     }
-                                    let chip = egui::Button::new(
-                                        egui::RichText::new(mb.to_string()).size(12.0).color(MUTED),
-                                    )
-                                    .frame(false);
-                                    if ui.add(chip).on_hover_text(format!("{mb} MB")).clicked() {
-                                        self.fit_text = mb.to_string();
-                                        c = Choice::Fit;
-                                    }
-                                }
-                                ui.label(theme::small("MB"));
-                            });
-                            bottom(ui, |ui| match &fit {
-                                None => {
-                                    ui.label(theme::small("Type a size in MB"));
-                                }
-                                Some(FitEstimate::TooSmall { min_mb }) => {
-                                    ui.label(
-                                        egui::RichText::new("Too small for this length")
-                                            .color(theme::DANGER),
-                                    );
-                                    ui.label(theme::small(format!("Try at least {min_mb} MB")));
-                                }
-                                Some(FitEstimate::Original(e)) => {
-                                    quality_row(ui, Quality::Great);
-                                    ui.label(theme::small(format!(
-                                        "Already fits · {}",
-                                        format::ready_in(e.seconds)
-                                    )));
-                                }
-                                Some(FitEstimate::Encode(e)) => {
-                                    quality_row(ui, e.quality.unwrap_or(Quality::Good));
-                                    ui.label(
-                                        egui::RichText::new(format::ready_in(e.seconds))
-                                            .size(12.0)
-                                            .color(MUTED),
-                                    );
-                                }
-                            });
-                            c
-                        },
-                    );
-
-                    // Presets
-                    self.choice = card(
-                        &mut cols[2],
-                        self.choice == Choice::Preset,
-                        Choice::Preset,
-                        |ui| {
-                            let mut c = self.choice;
-                            ui.radio_value(&mut c, Choice::Preset, theme::strong("Presets"));
-                            let before = self.preset_id.clone();
-                            let combo = egui::ComboBox::from_id_salt("preset")
-                                .width(ui.available_width())
-                                .selected_text(preset.name.clone())
-                                .show_ui(ui, |ui| {
-                                    for p in &presets {
-                                        ui.selectable_value(
-                                            &mut self.preset_id,
-                                            p.id.clone(),
-                                            p.name.clone(),
-                                        );
+                                    if theme::menu_danger(ui, Icon::Trash, "Delete", None).clicked()
+                                    {
+                                        delete_profile = Some(p.id.clone());
+                                        ui.close();
                                     }
                                 });
-                            if self.preset_id != before || combo.response.clicked() {
-                                c = Choice::Preset;
                             }
-                            ui.label(egui::RichText::new(preset.description.clone()).size(12.0));
-                            bottom(ui, |ui| {
-                                ui.label(theme::strong(format::about_size(preset_est.bytes)));
-                                ui.label(theme::small(format::ready_in(preset_est.seconds)));
-                            });
-                            c
-                        },
-                    );
-                });
+                        }
+                    })
+                    .response
+                    .rect;
+                ui.painter().rect_stroke(
+                    group,
+                    8,
+                    Stroke::new(1.0, BORDER),
+                    egui::StrokeKind::Inside,
+                );
 
-                ui.add_space(16.0);
-                ui.label(theme::caption("Output"));
-                ui.add_space(2.0);
+                // Name and folder.
+                let field_w = ui.available_width() - 64.0 - 10.0;
                 egui::Grid::new("export-fields")
                     .num_columns(2)
-                    .spacing([16.0, 12.0])
-                    .min_col_width(80.0)
+                    .spacing([10.0, 10.0])
+                    .min_col_width(64.0)
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Name").color(MUTED));
+                        ui.label(theme::form_label("Name"));
                         let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.name)
-                                .desired_width(f32::INFINITY)
-                                .margin(egui::vec2(10.0, 8.0)),
+                            theme::Field::new(&mut self.name, "Name")
+                                .suffix(&ext)
+                                .width(field_w),
                         );
-                        if self.focus_once {
-                            r.request_focus();
-                            self.focus_once = false;
-                        }
                         if r.changed() {
                             self.conflict = None;
                         }
                         ui.end_row();
-                        ui.label(egui::RichText::new("Save to").color(MUTED));
+                        ui.label(theme::form_label("Save to"));
                         ui.horizontal(|ui| {
-                            let w = ui.available_width() - 118.0;
+                            let w = field_w - CHOOSE_W - ui.spacing().item_spacing.x;
                             if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.folder)
-                                        .desired_width(w)
-                                        .margin(egui::vec2(10.0, 8.0)),
-                                )
+                                .add(theme::Field::new(&mut self.folder, "Save to").width(w))
                                 .changed()
                             {
                                 self.conflict = None;
                             }
                             if ui
-                                .add(theme::secondary("Choose…").icon(Icon::Folder).height(34.0))
+                                .add(
+                                    theme::secondary("Choose…")
+                                        .icon(Icon::Folder)
+                                        .min_width(CHOOSE_W),
+                                )
                                 .clicked()
                                 && self.folder_rx.is_none()
                             {
@@ -431,22 +461,22 @@ impl ExportDialog {
                             }
                         });
                         ui.end_row();
-                        if segments.len() > 1 {
-                            ui.label(egui::RichText::new("Parts").color(MUTED));
-                            ui.horizontal(|ui| {
-                                if theme::pill(ui, !self.separate, "One video").clicked() {
-                                    self.separate = false;
-                                    self.conflict = None;
-                                }
-                                if theme::pill(ui, self.separate, "Separate videos").clicked() {
-                                    self.separate = true;
-                                    self.conflict = None;
-                                }
-                            });
+                        if n > 1 {
+                            ui.label(theme::form_label("Parts"));
+                            if let Some(i) = theme::segmented(
+                                ui,
+                                "parts",
+                                &["One video", "Separate videos"],
+                                self.separate as usize,
+                                None,
+                            ) {
+                                self.separate = i == 1;
+                                self.conflict = None;
+                            }
                             ui.end_row();
                         }
                         if first_audio.len() > 1 {
-                            ui.label(egui::RichText::new("Audio").color(MUTED));
+                            ui.label(theme::form_label("Audio"));
                             ui.horizontal(|ui| {
                                 for (i, name) in first_audio.iter().enumerate() {
                                     if let Some(on) = self.audio.get_mut(i) {
@@ -459,10 +489,9 @@ impl ExportDialog {
                     });
 
                 if let Some(files) = &self.conflict {
-                    ui.add_space(8.0);
                     egui::Frame::new()
                         .fill(theme::BG)
-                        .stroke(Stroke::new(1.0, theme::TRIM.linear_multiply(0.5)))
+                        .stroke(Stroke::new(1.0, theme::FIELD_FOCUS))
                         .corner_radius(8)
                         .inner_margin(12)
                         .show(ui, |ui| {
@@ -491,75 +520,56 @@ impl ExportDialog {
                         });
                 }
                 if let Some(e) = &self.error {
-                    ui.add_space(4.0);
                     ui.label(egui::RichText::new(e.clone()).color(theme::DANGER));
                 }
             });
-            let r = ui.max_rect();
-            ui.painter().hline(
-                r.x_range(),
-                ui.cursor().top(),
-                Stroke::new(1.0, theme::HAIRLINE),
-            );
-            egui::Frame::new()
-                .fill(theme::BG)
-                .corner_radius(egui::CornerRadius {
-                    nw: 0,
-                    ne: 0,
-                    sw: 14,
-                    se: 14,
-                })
-                .inner_margin(egui::Margin::symmetric(20, 12))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(theme::ghost("Advanced…").icon(Icon::Sliders))
-                            .on_hover_text("Codecs, resolution, bitrate and your own presets")
-                            .clicked()
-                        {
-                            outcome = ExportOutcome::Advanced;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let can_save = self.chosen_profile(app, &fit).is_some()
-                                && !self.name.trim().is_empty();
-                            if ui
-                                .add_enabled(
-                                    can_save,
-                                    theme::primary("Save")
-                                        .icon(Icon::Check)
-                                        .height(36.0)
-                                        .min_width(108.0),
-                                )
-                                .clicked()
-                            {
-                                save = true;
-                            }
-                            if ui
-                                .add(theme::secondary("Cancel").height(36.0).min_width(92.0))
-                                .clicked()
-                            {
-                                outcome = ExportOutcome::Closed;
-                            }
-                        });
-                    });
+            modal::footer(ui, |ui| {
+                ui.add_space(-10.0);
+                if ui
+                    .add(theme::ghost("New profile…").icon(Icon::Sliders))
+                    .on_hover_text("Pick the codec, size and frame rate yourself")
+                    .clicked()
+                {
+                    outcome =
+                        Outcome::Push(Dialog::Profile(Box::new(ProfileDialog::new(app, None))));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_save = chosen.is_some() && !self.name.trim().is_empty();
+                    if ui
+                        .add_enabled(can_save, theme::primary("Export").icon(Icon::Check))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.add(theme::secondary("Cancel")).clicked() {
+                        outcome = Outcome::Close;
+                    }
                 });
+            });
         });
-        if resp.should_close() && !matches!(outcome, ExportOutcome::Advanced) {
-            outcome = ExportOutcome::Closed;
+
+        if let Some(id) = edit_profile {
+            outcome = Outcome::Push(Dialog::Profile(Box::new(ProfileDialog::new(
+                app,
+                Some(&id),
+            ))));
         }
-        if ctx.input(|i| i.key_pressed(Key::Enter))
-            && self.conflict.is_none()
-            && !ctx.any_popup_open()
-        {
+        if let Some(id) = delete_profile {
+            app.profiles.remove(&id);
+            app.save_profiles();
+            if self.picked == id {
+                self.picked = ORIGINAL_ID.into();
+            }
+        }
+        if enter && self.conflict.is_none() {
             save = true;
         }
-
-        if save || save_mode.is_some() {
+        if (save || save_mode.is_some()) && matches!(outcome, Outcome::Stay) {
             let Some(profile) = self.chosen_profile(app, &fit) else {
                 return outcome;
             };
             match self.submit(app, profile, save_mode) {
-                Ok(true) => return ExportOutcome::Closed,
+                Ok(true) => return Outcome::Close,
                 Ok(false) => {}
                 Err(e) => self.error = Some(e),
             }
@@ -578,7 +588,7 @@ impl ExportDialog {
         if name.is_empty() || name.contains('/') || name == "." || name == ".." {
             return Err("Give the video a name (without slashes).".into());
         }
-        let folder = PathBuf::from(shell_home(self.folder.trim()));
+        let folder = modal::shellexpand_home(self.folder.trim());
         if !folder.is_dir() {
             return Err("That folder doesn't exist. Pick one with Choose….".into());
         }
@@ -620,9 +630,7 @@ impl ExportDialog {
             app.last_fit_mb = Some(mb);
         }
         app.last_export_dir = Some(folder);
-        if let Some(e) = &app.engine {
-            e.submit(req, outputs);
-        }
+        app.submit_export(req, outputs);
         Ok(true)
     }
 }
@@ -631,13 +639,6 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
-    }
-}
-
-fn shell_home(s: &str) -> String {
-    match (s.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(h)) => format!("{h}/{rest}"),
-        _ => s.to_string(),
     }
 }
 
@@ -656,57 +657,189 @@ fn trim_num(v: f64) -> String {
     }
 }
 
-/// One of the three choice cards. Clicking anywhere on it selects it.
-/// The background click area is registered before the contents (using last
-/// frame's rect) so the radio, text box and menu inside still get their clicks.
-fn card(
-    ui: &mut egui::Ui,
-    on: bool,
-    me: Choice,
-    add: impl FnOnce(&mut egui::Ui) -> Choice,
-) -> Choice {
-    let id = ui.scope_id().with(("card", me as u8));
-    let prev: Option<egui::Rect> = ui.ctx().data(|d| d.get_temp(id));
-    let bg_clicked = prev
-        .map(|r| ui.interact(r, id, egui::Sense::click()).clicked())
-        .unwrap_or(false);
-    let frame = egui::Frame::new()
-        .fill(if on { ACCENT_SOFT } else { theme::RAISED })
-        .stroke(if on {
-            Stroke::new(1.5, ACCENT)
-        } else {
-            Stroke::new(1.0, BORDER)
-        })
-        .corner_radius(10)
-        .inner_margin(16);
-    let r = frame.show(ui, |ui| {
-        ui.set_min_height(CARD_H);
-        ui.spacing_mut().item_spacing.y = 6.0;
-        add(ui)
-    });
-    ui.ctx().data_mut(|d| d.insert_temp(id, r.response.rect));
-    if bg_clicked {
-        me
-    } else {
-        r.inner
+/// The line under Fit to size's box, and its colour.
+fn fit_status(fit: &Option<FitEstimate>) -> (String, Color32) {
+    match fit {
+        None => ("Type a size in MB".into(), MUTED),
+        Some(FitEstimate::TooSmall { min_mb }) => {
+            (format!("Too small · try {min_mb} MB"), theme::DANGER)
+        }
+        Some(FitEstimate::Original(e)) => (
+            format!("Already fits · {}", format::ready_in(e.seconds)),
+            theme::SUCCESS,
+        ),
+        Some(FitEstimate::Encode(e)) => (
+            format!(
+                "{} · {}",
+                quality_words(e.quality.unwrap_or(Quality::Good)),
+                format::ready_in(e.seconds)
+            ),
+            theme::SUCCESS,
+        ),
     }
 }
 
-/// Inner height of every card, so the three line up.
-const CARD_H: f32 = 172.0;
-
-/// Push the estimate lines to the bottom of a card.
-fn bottom(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    // Measure from the cursor: min_rect already includes the card's minimum height.
-    let used = ui.cursor().top() - ui.min_rect().top();
-    let space = (CARD_H - used - 46.0).max(4.0);
-    ui.add_space(space);
-    add(ui);
+fn quality_words(q: Quality) -> String {
+    q.label().to_string()
 }
 
-fn quality_row(ui: &mut egui::Ui, q: Quality) {
-    ui.horizontal(|ui| {
-        ui.label(theme::strong(q.label()));
-        theme::quality_bars(ui, q.bars());
-    });
+struct RowSpec<'a> {
+    name: &'a str,
+    desc: &'a str,
+    selected: bool,
+    first: bool,
+    last: bool,
+    /// Room for Fit to size's box and the line under it.
+    tall: bool,
+}
+
+/// One radio row: ring, name over a short description, and `right` on the
+/// right. Clicking anywhere on it picks it; controls inside still get their
+/// own clicks because they're laid on top.
+fn row(
+    ui: &mut egui::Ui,
+    spec: RowSpec,
+    right: impl FnOnce(&mut egui::Ui, egui::Rect),
+) -> egui::Response {
+    let h = if spec.tall { 64.0 } else { 52.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::click());
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, enabled, spec.selected, spec.name));
+    let p = ui.painter().clone();
+    let radius = egui::CornerRadius {
+        nw: if spec.first { 8 } else { 0 },
+        ne: if spec.first { 8 } else { 0 },
+        sw: if spec.last { 8 } else { 0 },
+        se: if spec.last { 8 } else { 0 },
+    };
+    if spec.selected {
+        p.rect_filled(rect, radius, theme::ACCENT_SOFT);
+    } else if resp.hovered() {
+        p.rect_filled(rect, radius, theme::RAISED);
+    }
+    if !spec.first {
+        p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, BORDER));
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // Radio ring.
+    let c = egui::pos2(rect.left() + 12.0 + 8.0, rect.center().y);
+    p.circle_stroke(
+        c,
+        7.0,
+        Stroke::new(
+            2.0,
+            if spec.selected {
+                ACCENT
+            } else {
+                theme::BORDER_STRONG
+            },
+        ),
+    );
+    if spec.selected {
+        p.circle_filled(c, 3.0, ACCENT);
+    }
+    // Name and description.
+    let text_left = rect.left() + 12.0 + 18.0 + 12.0;
+    let name = p.layout_no_wrap(
+        spec.name.to_string(),
+        egui::FontId::new(13.0, theme::semibold_family()),
+        theme::TEXT,
+    );
+    let desc = p.layout_no_wrap(
+        spec.desc.to_string(),
+        egui::FontId::proportional(12.0),
+        MUTED,
+    );
+    let block_h = name.size().y + 1.0 + desc.size().y;
+    let top = rect.center().y - block_h / 2.0;
+    let right_w = 190.0;
+    let clip = egui::Rect::from_x_y_ranges(text_left..=rect.right() - right_w, rect.y_range());
+    let tp = p.with_clip_rect(clip);
+    let name_h = name.size().y;
+    tp.galley(egui::pos2(text_left, top), name, theme::TEXT);
+    tp.galley(egui::pos2(text_left, top + name_h + 1.0), desc, MUTED);
+    // The right-hand side, inset from the row's edges.
+    let r = egui::Rect::from_x_y_ranges(
+        rect.right() - right_w..=rect.right() - 12.0,
+        rect.top() + 8.0..=rect.bottom() - 8.0,
+    );
+    right(ui, r);
+    resp
+}
+
+/// The `Yours` caption between built-in and own profiles.
+fn section(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 0, theme::SECTION);
+    p.hline(rect.x_range(), rect.top(), Stroke::new(1.0, BORDER));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(12.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.label(
+        egui::RichText::new(text.to_uppercase())
+            .size(11.0)
+            .extra_letter_spacing(0.8)
+            .color(MUTED),
+    );
+}
+
+/// Two right-aligned lines, centred in `r`: `about 21 MB` over `in seconds`.
+fn two_lines(ui: &egui::Ui, r: egui::Rect, top: &str, bottom: &str, bottom_color: Color32) {
+    let p = ui.painter();
+    let t = p.layout_no_wrap(
+        top.to_string(),
+        egui::FontId::proportional(13.0),
+        theme::TEXT,
+    );
+    let b = p.layout_no_wrap(
+        bottom.to_string(),
+        egui::FontId::proportional(11.5),
+        bottom_color,
+    );
+    let h = t.size().y + 1.0 + b.size().y;
+    let y = r.center().y - h / 2.0;
+    let th = t.size().y;
+    p.galley(egui::pos2(r.right() - t.size().x, y), t, theme::TEXT);
+    p.galley(
+        egui::pos2(r.right() - b.size().x, y + th + 1.0),
+        b,
+        bottom_color,
+    );
+}
+
+fn estimate_lines(ui: &egui::Ui, r: egui::Rect, e: &Estimate) {
+    two_lines(
+        ui,
+        r,
+        &format::about_size(e.bytes),
+        &format::ready_in(e.seconds),
+        MUTED,
+    );
+}
+
+fn info_lines(ui: &egui::Ui, r: egui::Rect, info: &RowInfo) {
+    match info {
+        RowInfo::Estimate(e) => estimate_lines(ui, r, e),
+        RowInfo::Fit(f, mb) => {
+            let (top, bottom) = match f {
+                Some(FitEstimate::Encode(e)) => (
+                    format!("under {} MB", trim_num(*mb)),
+                    format::ready_in(e.seconds),
+                ),
+                Some(FitEstimate::Original(e)) => {
+                    (format::about_size(e.bytes), format::ready_in(e.seconds))
+                }
+                Some(FitEstimate::TooSmall { min_mb }) => {
+                    ("Too small".into(), format!("needs {min_mb} MB"))
+                }
+                None => (String::new(), String::new()),
+            };
+            two_lines(ui, r, &top, &bottom, MUTED);
+        }
+    }
 }

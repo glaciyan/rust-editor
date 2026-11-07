@@ -222,12 +222,12 @@ pub fn encode(
         RateControl::Bitrate(k) => (
             k as f64 * 1000.0,
             ratio_quality(k as f64 * 1000.0, codec, w, h, fps),
-            1.55,
+            1.0 + plan::first_pass_cost(codec),
         ),
         RateControl::TargetSize(mb) => (
             mb * 1e6 * 8.0 / dur.max(0.1) - audio_bps,
             Quality::Good,
-            1.55,
+            1.0 + plan::first_pass_cost(codec),
         ),
     };
     let (bytes, secs_per_sec) = match cal {
@@ -318,7 +318,7 @@ pub fn fit(
             FitEstimate::Encode(Estimate {
                 bytes: st.expected_bytes,
                 seconds: if w > 0 {
-                    per * dur * 1.55 + 2.0
+                    per * dur * (1.0 + plan::first_pass_cost(codec)) + 2.0
                 } else {
                     0.02 * dur + 1.0
                 },
@@ -328,6 +328,18 @@ pub fn fit(
             })
         }
     }
+}
+
+/// `-x265-params` without the two-pass options.
+fn single_pass_x265(params: &str) -> String {
+    params
+        .split(':')
+        .filter(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            !matches!(key, "pass" | "stats" | "slow-firstpass")
+        })
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Encode a short sample with the request's settings and time it.
@@ -430,9 +442,10 @@ pub fn calibrate(
         _ => None,
     })?;
     let mut cmd = step;
-    // A single-pass stand-in for a two-pass encode: drop the pass options.
+    // A single-pass stand-in for a two-pass encode: drop the pass options,
+    // keep the rest (block size changes the speed a lot at small sizes).
     if let Some(i) = cmd.output_args.iter().position(|a| a == "-x265-params") {
-        cmd.output_args[i + 1] = "log-level=error".into();
+        cmd.output_args[i + 1] = single_pass_x265(&cmd.output_args[i + 1]);
     }
     if let Some(i) = cmd.output_args.iter().position(|a| a == "-pass") {
         cmd.output_args.drain(i..i + 4);
@@ -446,4 +459,23 @@ pub fn calibrate(
         bytes_per_sec: bytes / sample,
         secs_per_sec: wall / sample,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_keeps_x265_settings_but_not_passes() {
+        assert_eq!(
+            single_pass_x265(
+                "log-level=error:ctu=32:pass=1:stats=/tmp/a.x265.log:slow-firstpass=0"
+            ),
+            "log-level=error:ctu=32"
+        );
+        assert_eq!(
+            single_pass_x265("log-level=error:pass=2:stats=/tmp/a.x265.log"),
+            "log-level=error"
+        );
+    }
 }

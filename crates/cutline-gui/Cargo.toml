@@ -22,3 +22,6 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 [target.'cfg(target_os = "linux")'.dependencies]
 # Same winit eframe uses; needed to pick the X11 backend (see main.rs).
 winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[dev-dependencies]
+egui_kittest = "0.37"
