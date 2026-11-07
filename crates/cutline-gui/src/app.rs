@@ -1,8 +1,10 @@
-//! The main window: one big preview, one timeline, one Export button.
+//! The main window: header with Export, a big viewer with transport and
+//! volume, the timeline with its toolbar, and a status bar.
 
 use crate::dialogs::{AdvancedEditor, DetailsWindow};
 use crate::export::{ExportDialog, ExportOutcome};
-use crate::theme::{self, INK, MUTED};
+use crate::icons::{self, Icon};
+use crate::theme::{self, MUTED};
 use crate::timeline::{self, TimelineAction, TimelineView};
 use cutline_core::{format, PartMode, Project, Timestamp};
 use cutline_engine::estimate::Calibration;
@@ -12,7 +14,7 @@ use cutline_engine::{Engine, EngineEvent};
 use cutline_ffmpeg::{probe, MediaInfo, Tools};
 use cutline_preview::thumbs::{ThumbRequest, Thumbnailer};
 use cutline_preview::Player;
-use eframe::egui::{self, Color32, Key, Modifiers, Stroke};
+use eframe::egui::{self, Color32, Key, Modifiers, Sense, Stroke};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -106,10 +108,15 @@ pub struct CutlineApp {
     file_dialog_rx: Option<(Receiver<Option<Vec<PathBuf>>>, Instant)>,
     path_prompt: Option<String>,
     confirm_quit: bool,
-    /// Height of everything under the preview, measured last frame.
-    below_h: f32,
     title: String,
+    /// Preview volume 0–100, and whether it's muted.
+    pub volume: f64,
+    pub muted: bool,
 }
+
+const HEADER_H: f32 = 52.0;
+const STATUS_H: f32 = 32.0;
+const TRANSPORT_H: f32 = 60.0;
 
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -227,9 +234,15 @@ impl CutlineApp {
             file_dialog_rx: None,
             path_prompt: None,
             confirm_quit: false,
-            below_h: 260.0,
             title: String::new(),
+            volume: 100.0,
+            muted: false,
         };
+        if let Some(s) = store::load_session() {
+            app.volume = s.volume.clamp(0.0, 100.0);
+            app.muted = s.muted;
+        }
+        app.apply_volume();
         if args.is_empty() {
             app.restore_session();
         } else {
@@ -262,6 +275,8 @@ impl CutlineApp {
             project: self.project.clone(),
             playhead: self.playhead.map(|(c, t)| (c, t.secs())),
             last_export_dir: self.last_export_dir.clone(),
+            volume: self.volume,
+            muted: self.muted,
         }
     }
 
@@ -811,61 +826,85 @@ impl CutlineApp {
             if i.consume_key(Modifiers::NONE, Key::A) {
                 actions.push("add");
             }
+            if i.consume_key(Modifiers::NONE, Key::M) {
+                actions.push("mute");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                actions.push("vol-up");
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                actions.push("vol-down");
+            }
         });
         for a in actions {
-            match a {
-                "export" => self.open_export(),
-                "open" => self.open_dialog(),
-                "undo" => self.undo(),
-                "redo" => self.redo(),
-                "play" => self.toggle_play(),
-                "in" | "out" => {
-                    if let Some((clip, t)) = self.playhead {
-                        self.checkpoint();
-                        if a == "in" {
-                            self.project.set_in(clip, t);
-                        } else {
-                            self.project.set_out(clip, t);
-                        }
-                        self.was_in_kept = self.project.is_kept(clip, t);
+            self.run_action(a);
+        }
+    }
+
+    fn run_action(&mut self, a: &str) {
+        match a {
+            "export" => self.open_export(),
+            "open" => self.open_dialog(),
+            "undo" => self.undo(),
+            "redo" => self.redo(),
+            "play" => self.toggle_play(),
+            "in" | "out" => {
+                if let Some((clip, t)) = self.playhead {
+                    self.checkpoint();
+                    if a == "in" {
+                        self.project.set_in(clip, t);
+                    } else {
+                        self.project.set_out(clip, t);
                     }
+                    self.was_in_kept = self.project.is_kept(clip, t);
                 }
-                "delete" => {
-                    if let Some(s) = self.project.selected {
-                        self.checkpoint();
-                        self.project.remove_part(s);
-                    }
-                }
-                "prev-frame" => self.frame_step(-1.0),
-                "next-frame" => self.frame_step(1.0),
-                "back-1s" | "fwd-1s" => {
-                    if let Some((clip, t)) = self.playhead {
-                        let dur = self
-                            .project
-                            .clip(clip)
-                            .map(|c| c.duration)
-                            .unwrap_or_default();
-                        let d = if a == "fwd-1s" { 1.0 } else { -1.0 };
-                        self.seek(
-                            clip,
-                            Timestamp::from_secs(t.secs() + d).clamp(Timestamp::ZERO, dur),
-                        );
-                    }
-                }
-                "home" => {
-                    if let Some(c) = self.project.clips.first().map(|c| c.id) {
-                        self.seek(c, Timestamp::ZERO);
-                    }
-                }
-                "end" => {
-                    if let Some(c) = self.project.clips.last() {
-                        let (id, d) = (c.id, c.duration);
-                        self.seek(id, d);
-                    }
-                }
-                "add" => self.add_part_at_playhead(),
-                _ => {}
             }
+            "delete" => {
+                if let Some(s) = self.project.selected {
+                    self.checkpoint();
+                    self.project.remove_part(s);
+                }
+            }
+            "prev-frame" => self.frame_step(-1.0),
+            "next-frame" => self.frame_step(1.0),
+            "back-1s" | "fwd-1s" => {
+                if let Some((clip, t)) = self.playhead {
+                    let dur = self
+                        .project
+                        .clip(clip)
+                        .map(|c| c.duration)
+                        .unwrap_or_default();
+                    let d = if a == "fwd-1s" { 1.0 } else { -1.0 };
+                    self.seek(
+                        clip,
+                        Timestamp::from_secs(t.secs() + d).clamp(Timestamp::ZERO, dur),
+                    );
+                }
+            }
+            "home" => {
+                if let Some(c) = self.project.clips.first().map(|c| c.id) {
+                    self.seek(c, Timestamp::ZERO);
+                }
+            }
+            "end" => {
+                if let Some(c) = self.project.clips.last() {
+                    let (id, d) = (c.id, c.duration);
+                    self.seek(id, d);
+                }
+            }
+            "add" => self.add_part_at_playhead(),
+            "mute" => self.toggle_mute(),
+            "vol-up" => self.set_volume(self.shown_volume() + 5.0),
+            "vol-down" => self.set_volume(self.shown_volume() - 5.0),
+            _ => {}
+        }
+    }
+
+    fn shown_volume(&self) -> f64 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume
         }
     }
 
@@ -885,89 +924,173 @@ impl CutlineApp {
 
     // ---------- drawing ----------
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.set_min_height(48.0);
-            if ui
-                .add(theme::quiet("Open"))
-                .on_hover_text("Open videos (Ctrl+O)")
-                .clicked()
-            {
-                self.open_dialog();
-            }
-            let title = match self.project.clips.len() {
-                0 => String::new(),
-                1 => self.project.clips[0].name(),
-                n => format!("{} videos", n),
-            };
-            let export_w = 110.0;
-            let avail = ui.available_width() - export_w - 16.0;
-            ui.allocate_ui_with_layout(
-                egui::vec2(avail.max(0.0), 40.0),
-                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                |ui| {
-                    ui.label(egui::RichText::new(title).color(MUTED));
-                },
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let enabled = !self.project.is_empty() && self.tools.is_some();
-                if ui
-                    .add_enabled(enabled, theme::primary("Export"))
-                    .on_hover_text("Ctrl+E")
-                    .clicked()
-                {
-                    self.open_export();
+    /// The title and the facts shown next to it in the header.
+    fn file_facts(&self) -> (String, Vec<String>) {
+        let total = self.project.total_duration().secs();
+        match self.project.clips.len() {
+            0 => (String::new(), vec![]),
+            1 => {
+                let c = &self.project.clips[0];
+                let mut facts = vec![];
+                if let Some(v) = self.sources.get(&c.path).and_then(|m| m.video.as_ref()) {
+                    let (w, h) = v.display_size();
+                    facts.push(format!("{w}×{h}"));
+                    if v.fps > 0.0 {
+                        facts.push(format!("{} fps", trim_fps(v.fps)));
+                    }
+                    facts.push(codec_name(&v.codec));
                 }
-            });
-        });
+                facts.push(format::clock(total));
+                (c.name(), facts)
+            }
+            n => (format!("{n} videos"), vec![format::clock(total)]),
+        }
     }
 
-    fn preview_area(&mut self, ui: &mut egui::Ui, height: f32) {
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height),
-            egui::Sense::click(),
+    fn header(&mut self, ui: &mut egui::Ui) {
+        let full = ui.max_rect();
+        let mut undo = false;
+        let mut redo = false;
+
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(full)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 8, Color32::from_rgb(0x16, 0x16, 0x14));
-        if self.project.is_empty() && self.pending.is_empty() {
-            painter.rect_filled(rect, 8, theme::WELL);
-            painter.rect_stroke(
-                rect,
-                8,
-                Stroke::new(1.0, theme::BORDER),
+        let (logo, _) = left.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::hover());
+        icons::logo(left.painter(), logo);
+        left.add_space(2.0);
+        left.label(theme::strong("Cutline").size(14.5));
+        left.add_space(4.0);
+        theme::vsep(&mut left, 22.0);
+        if left
+            .add(theme::secondary("Open").icon(Icon::Open))
+            .on_hover_text("Open videos (Ctrl+O)")
+            .clicked()
+        {
+            self.open_dialog();
+        }
+        let left_end = left.min_rect().right();
+
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(full)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        let enabled = !self.project.is_empty() && self.tools.is_some();
+        if right
+            .add_enabled(
+                enabled,
+                theme::primary("Export")
+                    .icon(Icon::Export)
+                    .height(34.0)
+                    .min_width(112.0),
+            )
+            .on_hover_text("Export (Ctrl+E)")
+            .clicked()
+        {
+            self.open_export();
+        }
+        right.add_space(4.0);
+        theme::vsep(&mut right, 22.0);
+        right.add_enabled_ui(!self.redo.is_empty(), |ui| {
+            redo = theme::icon_button(ui, Icon::Redo, 32.0, "Redo (Ctrl+Shift+Z)").clicked();
+        });
+        right.add_enabled_ui(!self.undo.is_empty(), |ui| {
+            undo = theme::icon_button(ui, Icon::Undo, 32.0, "Undo (Ctrl+Z)").clicked();
+        });
+        let right_start = right.min_rect().left();
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+
+        // File name and facts, centred in the window, dropping facts when tight.
+        let (name, mut facts) = self.file_facts();
+        if name.is_empty() {
+            return;
+        }
+        let p = ui.painter();
+        let name_g = p.layout_no_wrap(
+            name,
+            egui::FontId::new(13.5, theme::semibold_family()),
+            theme::TEXT,
+        );
+        let room = (right_start - left_end - 32.0).max(0.0);
+        let chip_w = |f: &String| {
+            p.layout_no_wrap(f.clone(), egui::FontId::proportional(11.5), MUTED)
+                .size()
+                .x
+                + 14.0
+        };
+        let width = |facts: &Vec<String>| {
+            name_g.size().x + facts.iter().map(|f| chip_w(f) + 6.0).sum::<f32>() + 6.0
+        };
+        while !facts.is_empty() && width(&facts) > room {
+            facts.remove(0);
+        }
+        let w = width(&facts).min(room);
+        let mut x = (full.center().x - w / 2.0)
+            .max(left_end + 16.0)
+            .min(right_start - 16.0 - w);
+        let cy = full.center().y;
+        let clip =
+            egui::Rect::from_x_y_ranges(left_end + 16.0..=right_start - 16.0, full.y_range());
+        let p = p.with_clip_rect(clip);
+        let nw = name_g.size();
+        p.galley(egui::pos2(x, cy - nw.y / 2.0), name_g, theme::TEXT);
+        x += nw.x + 12.0;
+        for f in facts {
+            let g = p.layout_no_wrap(f, egui::FontId::proportional(11.5), MUTED);
+            let r = egui::Rect::from_min_size(
+                egui::pos2(x, cy - 11.0),
+                egui::vec2(g.size().x + 14.0, 22.0),
+            );
+            p.rect(
+                r,
+                5,
+                theme::RAISED,
+                Stroke::new(1.0, theme::HAIRLINE),
                 egui::StrokeKind::Inside,
             );
-            let c = rect.center();
-            painter.text(
-                c - egui::vec2(0.0, 28.0),
-                egui::Align2::CENTER_CENTER,
-                "Drop videos here",
-                egui::FontId::proportional(20.0),
-                INK,
-            );
-            painter.text(
-                c + egui::vec2(0.0, 2.0),
-                egui::Align2::CENTER_CENTER,
-                "or press Ctrl+O to open",
-                egui::FontId::proportional(14.0),
-                MUTED,
-            );
-            let b =
-                egui::Rect::from_center_size(c + egui::vec2(0.0, 44.0), egui::vec2(120.0, 40.0));
-            // A child ui so the button doesn't push the rest of the layout down.
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(b));
-            if child.add_sized(b.size(), theme::primary("Open…")).clicked() {
-                self.open_dialog();
-            }
+            p.galley(r.center() - g.size() / 2.0, g, MUTED);
+            x = r.right() + 6.0;
+        }
+    }
+
+    fn viewer(&mut self, ui: &mut egui::Ui, height: f32) {
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
+        let painter = ui.painter_at(rect);
+        painter.rect(
+            rect,
+            10,
+            theme::VIEWER,
+            Stroke::new(1.0, theme::HAIRLINE),
+            egui::StrokeKind::Inside,
+        );
+        if self.project.is_empty() && self.pending.is_empty() {
+            self.empty_state(ui, rect);
             return;
         }
         if self.project.is_empty() {
+            let mut child = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_center_size(
+                        rect.center() - egui::vec2(0.0, 14.0),
+                        egui::vec2(24.0, 24.0),
+                    ))
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+            );
+            child.add(egui::Spinner::new().size(22.0).color(MUTED));
             painter.text(
-                rect.center(),
+                rect.center() + egui::vec2(0.0, 18.0),
                 egui::Align2::CENTER_CENTER,
                 "Opening…",
-                egui::FontId::proportional(16.0),
-                Color32::from_gray(200),
+                egui::FontId::proportional(13.5),
+                MUTED,
             );
             return;
         }
@@ -993,11 +1116,14 @@ impl CutlineApp {
                 }
             }
         }
+        let inner = rect.shrink(1.0);
         if let Some(t) = &self.preview {
             let [w, h] = self.preview_size;
-            let s = (rect.width() / w as f32).min(rect.height() / h as f32);
-            let r =
-                egui::Rect::from_center_size(rect.center(), egui::vec2(w as f32 * s, h as f32 * s));
+            let s = (inner.width() / w as f32).min(inner.height() / h as f32);
+            let r = egui::Rect::from_center_size(
+                inner.center(),
+                egui::vec2(w as f32 * s, h as f32 * s),
+            );
             painter.image(
                 t.id(),
                 r,
@@ -1005,144 +1131,506 @@ impl CutlineApp {
                 Color32::WHITE,
             );
         }
-        // Show which part of the video is cut out right now.
+        // Say so when the picture under the playhead won't be in the export.
         if let Some((clip, t)) = self.playhead {
             if !self.project.is_kept(clip, t) {
-                let badge = egui::Rect::from_min_size(
-                    rect.left_top() + egui::vec2(12.0, 12.0),
-                    egui::vec2(150.0, 26.0),
+                let g = painter.layout_no_wrap(
+                    "Cut out of the export".into(),
+                    egui::FontId::new(12.0, theme::semibold_family()),
+                    Color32::WHITE,
                 );
-                painter.rect_filled(badge, 13, Color32::from_black_alpha(170));
-                painter.text(
-                    badge.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "Cut out of the export",
-                    egui::FontId::proportional(12.0),
+                let badge = egui::Rect::from_min_size(
+                    rect.left_top() + egui::vec2(14.0, 14.0),
+                    egui::vec2(g.size().x + 34.0, 28.0),
+                );
+                painter.rect(
+                    badge,
+                    14,
+                    Color32::from_black_alpha(190),
+                    Stroke::new(1.0, Color32::from_white_alpha(24)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.circle_filled(
+                    egui::pos2(badge.left() + 14.0, badge.center().y),
+                    4.0,
+                    theme::PLAYHEAD,
+                );
+                painter.galley(
+                    egui::pos2(badge.left() + 24.0, badge.center().y - g.size().y / 2.0),
+                    g,
                     Color32::WHITE,
                 );
             }
+        }
+        // A play hint over a paused picture.
+        if resp.hovered() && !self.playing() {
+            let c = rect.center();
+            painter.circle_filled(c, 34.0, Color32::from_black_alpha(150));
+            painter.circle_stroke(c, 34.0, Stroke::new(1.0, Color32::from_white_alpha(40)));
+            Icon::Play.paint(
+                &painter,
+                egui::Rect::from_center_size(c + egui::vec2(2.0, 0.0), egui::vec2(28.0, 28.0)),
+                Color32::WHITE,
+            );
+        }
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if resp.clicked() {
             self.toggle_play();
         }
     }
 
-    fn transport(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let playing = self.playing();
-            let (r, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
-            let hovered = resp.hovered();
-            let p = ui.painter();
-            p.circle_filled(
-                r.center(),
-                21.5,
-                if hovered { theme::WELL } else { theme::SURFACE },
+    fn empty_state(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let p = ui.painter_at(rect);
+        let r = rect.shrink(14.0);
+        let pts = vec![
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+            r.left_top(),
+        ];
+        p.extend(egui::Shape::dashed_line(
+            &pts,
+            Stroke::new(1.2, theme::BORDER),
+            7.0,
+            6.0,
+        ));
+        let tall = rect.height() > 320.0;
+        let c = rect.center() + egui::vec2(0.0, if tall { 18.0 } else { -4.0 });
+        if tall {
+            let ic = c - egui::vec2(0.0, 92.0);
+            p.circle(ic, 32.0, theme::RAISED, Stroke::new(1.0, theme::BORDER));
+            Icon::Film.paint(
+                &p,
+                egui::Rect::from_center_size(ic, egui::vec2(28.0, 28.0)),
+                MUTED,
             );
-            p.circle_stroke(r.center(), 21.5, Stroke::new(1.0, theme::BORDER));
-            let c = r.center();
-            if playing {
-                for dx in [-4.0, 4.0] {
-                    p.rect_filled(
-                        egui::Rect::from_center_size(
-                            c + egui::vec2(dx, 0.0),
-                            egui::vec2(4.0, 13.0),
-                        ),
-                        1,
-                        INK,
-                    );
-                }
-            } else {
-                p.add(egui::Shape::convex_polygon(
-                    vec![
-                        c + egui::vec2(-4.0, -7.0),
-                        c + egui::vec2(7.0, 0.0),
-                        c + egui::vec2(-4.0, 7.0),
-                    ],
-                    INK,
-                    Stroke::NONE,
-                ));
-            }
-            let resp = resp.on_hover_text(if playing {
-                "Pause (Space)"
-            } else {
-                "Play (Space)"
-            });
-            if resp.clicked() {
-                self.toggle_play();
-            }
-            let now = self
-                .playhead
-                .map(|(c, t)| self.project.clip_offset(c) + t)
-                .unwrap_or_default();
-            let total = self.project.total_duration();
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} / {}",
-                    format::clock(now.secs()),
-                    format::clock(total.secs())
-                ))
-                .monospace()
-                .size(14.0),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(theme::small("Space play · I / O set start and end"));
-                if let Some(p) = &self.player {
-                    if !p.has_sound() {
-                        ui.label(theme::small(
-                            "Preview has no sound (install mpv for sound) ·",
-                        ));
-                    }
-                }
-            });
-        });
+        }
+        p.text(
+            c - egui::vec2(0.0, 36.0),
+            egui::Align2::CENTER_CENTER,
+            "Drop videos here",
+            egui::FontId::new(20.0, theme::semibold_family()),
+            theme::TEXT,
+        );
+        p.text(
+            c - egui::vec2(0.0, 10.0),
+            egui::Align2::CENTER_CENTER,
+            "MP4, MKV, MOV and more · H.265 and H.264 cut on the exact frame",
+            egui::FontId::proportional(13.0),
+            MUTED,
+        );
+        let b = egui::Rect::from_center_size(c + egui::vec2(0.0, 32.0), egui::vec2(160.0, 38.0));
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(b).layout(
+            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        ));
+        if child
+            .add(
+                theme::primary("Open videos…")
+                    .icon(Icon::Open)
+                    .height(38.0)
+                    .min_width(160.0),
+            )
+            .clicked()
+        {
+            self.open_dialog();
+        }
+        p.text(
+            c + egui::vec2(0.0, 70.0),
+            egui::Align2::CENTER_CENTER,
+            "or press Ctrl+O",
+            egui::FontId::proportional(12.0),
+            theme::FAINT,
+        );
     }
 
-    fn part_controls(&mut self, ui: &mut egui::Ui) {
+    fn current_fps(&self) -> f64 {
+        self.playhead
+            .and_then(|(c, _)| self.project.clip(c))
+            .or_else(|| self.project.clips.first())
+            .map(|c| c.fps)
+            .filter(|f| *f > 0.0)
+            .unwrap_or(30.0)
+    }
+
+    fn transport(&mut self, ui: &mut egui::Ui) {
+        let (row, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), TRANSPORT_H),
+            Sense::hover(),
+        );
+        let has_media = !self.project.is_empty();
+
+        // Centre: transport buttons.
+        let center_w = 32.0 * 4.0 + 44.0 + 6.0 * 4.0 + 8.0;
+        let cr = egui::Rect::from_center_size(row.center(), egui::vec2(center_w, 44.0));
+        let mut actions: Vec<&str> = vec![];
+        let mut c = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(cr)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        c.spacing_mut().item_spacing.x = 6.0;
+        c.add_enabled_ui(has_media, |ui| {
+            if theme::icon_button(ui, Icon::ToStart, 32.0, "Go to start (Home)").clicked() {
+                actions.push("home");
+            }
+            if theme::icon_button(ui, Icon::StepBack, 32.0, "One frame back (←)").clicked() {
+                actions.push("prev-frame");
+            }
+            ui.add_space(4.0);
+            if self.play_button(ui).clicked() {
+                actions.push("play");
+            }
+            ui.add_space(4.0);
+            if theme::icon_button(ui, Icon::StepForward, 32.0, "One frame forward (→)").clicked()
+            {
+                actions.push("next-frame");
+            }
+            if theme::icon_button(ui, Icon::ToEnd, 32.0, "Go to end (End)").clicked() {
+                actions.push("end");
+            }
+        });
+        for a in actions {
+            self.run_action(a);
+        }
+
+        // Left: timecode.
+        let fps = self.current_fps();
+        let now = self
+            .playhead
+            .map(|(c, t)| self.project.clip_offset(c) + t)
+            .unwrap_or_default();
+        let total = self.project.total_duration();
+        let p = ui.painter();
+        let cur = p.layout_no_wrap(
+            timecode(now.secs(), fps),
+            egui::FontId::monospace(17.0),
+            if has_media { theme::TEXT } else { theme::FAINT },
+        );
+        let tot = p.layout_no_wrap(
+            format!("/ {}", timecode(total.secs(), fps)),
+            egui::FontId::monospace(12.0),
+            theme::FAINT,
+        );
+        let left_room = cr.left() - row.left() - 12.0;
+        let cy = row.center().y;
+        let tc_rect = egui::Rect::from_min_size(
+            egui::pos2(row.left() + 4.0, cy - cur.size().y / 2.0),
+            cur.size(),
+        );
+        let cur_w = cur.size().x;
+        if cur_w + 8.0 <= left_room {
+            p.galley(tc_rect.min, cur, theme::TEXT);
+            if cur_w + 12.0 + tot.size().x <= left_room {
+                p.galley(
+                    egui::pos2(tc_rect.right() + 10.0, cy - tot.size().y / 2.0 + 1.0),
+                    tot,
+                    theme::FAINT,
+                );
+            }
+            ui.interact(tc_rect, ui.scope_id().with("tc"), Sense::hover())
+                .on_hover_text("Hours : minutes : seconds : frames");
+        }
+
+        // Right: volume.
+        let rr = egui::Rect::from_min_max(egui::pos2(cr.right() + 12.0, row.top()), row.max);
+        let mut r = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rr)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        r.spacing_mut().item_spacing.x = 4.0;
+        self.volume_control(&mut r);
+    }
+
+    /// The round play / pause button in the middle of the transport.
+    fn play_button(&self, ui: &mut egui::Ui) -> egui::Response {
+        let playing = self.playing();
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), Sense::click());
+        let enabled = ui.is_enabled();
+        let p = ui.painter();
+        let fill = if !enabled {
+            theme::RAISED
+        } else if resp.is_pointer_button_down_on() {
+            Color32::from_gray(200)
+        } else if resp.hovered() {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(232)
+        };
+        p.circle_filled(r.center(), 21.0, fill);
+        let fg = if enabled { theme::VIEWER } else { theme::FAINT };
+        let icon = if playing { Icon::Pause } else { Icon::Play };
+        let off = if playing { 0.0 } else { 1.5 };
+        icon.paint(
+            p,
+            egui::Rect::from_center_size(r.center() + egui::vec2(off, 0.0), egui::vec2(20.0, 20.0)),
+            fg,
+        );
+        if resp.hovered() && enabled {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp.on_hover_text(if playing {
+            "Pause (Space)"
+        } else {
+            "Play (Space)"
+        })
+    }
+
+    pub fn set_volume(&mut self, v: f64) {
+        self.volume = v.clamp(0.0, 100.0).round();
+        if self.volume > 0.0 {
+            self.muted = false;
+        }
+        self.apply_volume();
+    }
+
+    fn toggle_mute(&mut self) {
+        if self.muted || self.volume <= 0.0 {
+            self.muted = false;
+            if self.volume <= 0.0 {
+                self.volume = 50.0;
+            }
+        } else {
+            self.muted = true;
+        }
+        self.apply_volume();
+    }
+
+    fn apply_volume(&mut self) {
+        let v = if self.muted { 0.0 } else { self.volume };
+        if let Some(p) = &mut self.player {
+            p.set_volume(v);
+        }
+    }
+
+    /// Mute button, slider and percentage, laid out right to left.
+    fn volume_control(&mut self, ui: &mut egui::Ui) {
+        let has_sound = self.player.as_ref().map(|p| p.has_sound()).unwrap_or(false);
+        let shown = if self.muted { 0.0 } else { self.volume };
+        // Percentage.
+        let (pr, _) = ui.allocate_exact_size(egui::vec2(36.0, 20.0), Sense::hover());
+        ui.painter().text(
+            pr.right_center(),
+            egui::Align2::RIGHT_CENTER,
+            if has_sound {
+                format!("{shown:.0}%")
+            } else {
+                "—".into()
+            },
+            egui::FontId::monospace(11.5),
+            theme::FAINT,
+        );
+        // Slider.
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(108.0, 24.0), Sense::click_and_drag());
+        let track =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width() - 12.0, 4.0));
+        if has_sound {
+            if resp.is_pointer_button_down_on() || resp.dragged() || resp.clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let f = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                    self.set_volume(f as f64 * 100.0);
+                }
+            }
+            if resp.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
+                if scroll != 0.0 {
+                    self.set_volume(shown + scroll as f64 * 0.25);
+                }
+            }
+        }
+        let shown = if self.muted { 0.0 } else { self.volume };
+        let active = has_sound && (resp.hovered() || resp.dragged());
+        let p = ui.painter();
+        p.rect_filled(track, 2, theme::HOVER);
+        let kx = track.left() + track.width() * (shown / 100.0) as f32;
+        let filled = egui::Rect::from_min_max(track.min, egui::pos2(kx, track.max.y));
+        let fill = if !has_sound {
+            theme::BORDER
+        } else if active {
+            theme::ACCENT
+        } else {
+            Color32::from_gray(200)
+        };
+        p.rect_filled(filled, 2, fill);
+        if has_sound {
+            let kr = if active { 7.0 } else { 6.0 };
+            p.circle_filled(
+                egui::pos2(kx, track.center().y + 1.0),
+                kr,
+                Color32::from_black_alpha(90),
+            );
+            p.circle_filled(egui::pos2(kx, track.center().y), kr, Color32::WHITE);
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+        }
+        if has_sound {
+            resp.on_hover_text(format!("Volume {shown:.0}% · scroll or ↑ / ↓ to change"));
+        } else {
+            resp.on_hover_text("The preview has no sound. Install libmpv to hear it.");
+        }
+        // Mute toggle.
+        let icon = if !has_sound || shown <= 0.0 {
+            Icon::Muted
+        } else if shown < 50.0 {
+            Icon::Volume(1)
+        } else {
+            Icon::Volume(2)
+        };
+        let mut toggle = false;
+        ui.add_enabled_ui(has_sound, |ui| {
+            toggle = theme::icon_button(
+                ui,
+                icon,
+                32.0,
+                if self.muted { "Unmute (M)" } else { "Mute (M)" },
+            )
+            .clicked();
+        });
+        if toggle {
+            self.toggle_mute();
+        }
+    }
+
+    /// The toolbar above the timeline: add/delete parts, keep or remove, totals.
+    fn edit_toolbar(&mut self, ui: &mut egui::Ui) {
+        let has_media = !self.project.is_empty();
         ui.horizontal(|ui| {
+            ui.set_min_height(34.0);
+            ui.spacing_mut().item_spacing.x = 6.0;
             if ui
-                .add(theme::quiet("+ Add part"))
+                .add_enabled(has_media, theme::secondary("Add part").icon(Icon::Plus))
                 .on_hover_text("Add a part at the playhead (A)")
                 .clicked()
             {
                 self.add_part_at_playhead();
             }
-            ui.add_space(4.0);
+            let selected = self
+                .project
+                .selected
+                .filter(|r| self.project.part(*r).is_some());
+            if ui
+                .add_enabled(
+                    selected.is_some(),
+                    theme::Btn::new(theme::Kind::Danger, "Delete part").icon(Icon::Close),
+                )
+                .on_hover_text("Delete the selected part (Delete)")
+                .on_disabled_hover_text("Click a part on the timeline to select it")
+                .clicked()
+            {
+                if let Some(s) = selected {
+                    self.checkpoint();
+                    self.project.remove_part(s);
+                }
+            }
+            theme::vsep(ui, 22.0);
             let keep = self.project.mode == PartMode::Keep;
-            if theme::pill(ui, keep, "Keep selected")
-                .on_hover_text("The marked parts are what you export")
-                .clicked()
-                && !keep
-            {
-                self.checkpoint();
-                self.project.set_mode(PartMode::Keep);
-            }
-            if theme::pill(ui, !keep, "Remove selected")
-                .on_hover_text("The marked parts are cut out")
-                .clicked()
-                && keep
-            {
-                self.checkpoint();
-                self.project.set_mode(PartMode::Remove);
-            }
+            ui.add_enabled_ui(has_media, |ui| {
+                let picked = theme::segmented(
+                    ui,
+                    &["Keep selected", "Remove selected"],
+                    if keep { 0 } else { 1 },
+                );
+                match picked {
+                    Some(0) if !keep => {
+                        self.checkpoint();
+                        self.project.set_mode(PartMode::Keep);
+                    }
+                    Some(1) if keep => {
+                        self.checkpoint();
+                        self.project.set_mode(PartMode::Remove);
+                    }
+                    _ => {}
+                }
+            })
+            .response
+            .on_hover_text("Keep selected: the marked parts are what you export.\nRemove selected: the marked parts are cut out.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let segs = self.project.segments();
-                let total: f64 = segs.iter().map(|s| s.len().secs()).sum();
-                if self.project.is_empty() {
+                if !has_media {
                     return;
                 }
-                ui.label(theme::small(if segs.is_empty() {
-                    "Everything is cut out".to_string()
-                } else {
-                    format!(
-                        "drag the handles to trim · export is {}",
-                        format::length(total)
-                    )
-                }));
+                let segs = self.project.segments();
+                let total: f64 = segs.iter().map(|s| s.len().secs()).sum();
+                if segs.is_empty() {
+                    ui.label(egui::RichText::new("Everything is cut out").color(theme::DANGER));
+                    return;
+                }
+                // Drop the totals rather than overlap the controls in a narrow window.
+                let room = ui.available_width();
+                if room < 150.0 {
+                    return;
+                }
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(theme::strong(format::length(total)).size(13.0));
+                ui.label(theme::caption("Export length"));
+                if room < 240.0 {
+                    return;
+                }
+                ui.add_space(14.0);
+                let n = segs.len();
+                ui.label(theme::strong(n.to_string()).size(13.0));
+                ui.label(theme::caption(if n == 1 { "Part" } else { "Parts" }));
             });
         });
     }
 
-    fn job_bar(&mut self, ui: &mut egui::Ui) {
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let shown_job = self.job_status(ui);
+            if !shown_job {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+                let has_sound = self.player.as_ref().map(|p| p.has_sound()).unwrap_or(true);
+                ui.painter().circle_filled(
+                    dot.center(),
+                    3.5,
+                    if self.project.is_empty() {
+                        theme::FAINT
+                    } else {
+                        theme::SUCCESS
+                    },
+                );
+                ui.label(theme::small(if self.project.is_empty() {
+                    "No video open"
+                } else {
+                    "Ready"
+                }));
+                if !has_sound {
+                    ui.label(theme::small(
+                        "· Preview has no sound (install libmpv for sound)",
+                    ));
+                }
+            }
+            // Shortcut hints on the right, if they fit.
+            let hints: [(&str, &str); 5] = [
+                ("Space", "Play"),
+                ("I  O", "Start / end"),
+                ("A", "Add part"),
+                ("← →", "Frame"),
+                ("M", "Mute"),
+            ];
+            let need = 430.0;
+            if ui.available_width() > need {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    for (i, (k, what)) in hints.iter().rev().enumerate() {
+                        if i > 0 {
+                            ui.add_space(8.0);
+                        }
+                        ui.label(egui::RichText::new(*what).size(11.5).color(theme::FAINT));
+                        keycap(ui, k);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Progress or result of the latest export, in the status bar.
+    /// Returns false when there's nothing to show.
+    fn job_status(&mut self, ui: &mut egui::Ui) -> bool {
         let waiting = self
             .jobs
             .iter()
@@ -1158,7 +1646,7 @@ impl CutlineApp {
                     .rposition(|j| !j.dismissed && !matches!(j.state, JobState::Waiting))
             })
         else {
-            return;
+            return false;
         };
         let mut cancel = None;
         let mut dismiss = false;
@@ -1170,118 +1658,85 @@ impl CutlineApp {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default()
         };
-        egui::Frame::new()
-            .stroke(Stroke::new(1.0, theme::BORDER))
-            .corner_radius(8)
-            .inner_margin(egui::Margin {
-                left: 16,
-                right: 8,
-                top: 4,
-                bottom: 4,
-            })
-            .show(ui, |ui| {
-                ui.set_min_height(44.0);
-                ui.horizontal(|ui| {
-                    ui.set_min_height(44.0);
-                    match &job.state {
-                        JobState::Running {
-                            fraction,
-                            eta,
-                            stage,
-                        } => {
-                            let mut text = format!("{stage} · {:.0}%", fraction * 100.0);
-                            if let Some(e) = eta {
-                                text.push_str(&format!(" · {}", format::time_left(*e)));
-                            }
-                            ui.label(text);
-                            ui.label(theme::small(
-                                job.outputs.first().map(name).unwrap_or_default(),
-                            ));
-                            ui.add(
-                                egui::ProgressBar::new(*fraction as f32)
-                                    .desired_width(120.0)
-                                    .desired_height(6.0)
-                                    .fill(theme::ACCENT),
-                            );
-                            if waiting > 0 {
-                                ui.label(theme::small(format!("{waiting} more waiting")));
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.add(theme::quiet("Cancel")).clicked() {
-                                        cancel = Some(job.id);
-                                    }
-                                },
-                            );
-                        }
-                        JobState::Done { outputs, .. } => {
-                            let bytes: u64 = outputs.iter().map(|o| o.bytes).sum();
-                            ui.label(format!("Saved · {}", format::size(bytes)));
-                            let label = if outputs.len() == 1 {
-                                name(&outputs[0].path)
-                            } else {
-                                format!("{} videos", outputs.len())
-                            };
-                            ui.label(theme::small(label));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.add(theme::quiet("×")).on_hover_text("Dismiss").clicked()
-                                    {
-                                        dismiss = true;
-                                    }
-                                    if ui.add(theme::quiet("Details")).clicked() {
-                                        open_details = Some(job.id);
-                                    }
-                                    if ui
-                                        .add(
-                                            theme::quiet("Show in folder")
-                                                .min_size(egui::vec2(0.0, 36.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        show = outputs.first().map(|o| o.path.clone());
-                                    }
-                                },
-                            );
-                        }
-                        JobState::Failed { message } => {
-                            ui.label(
-                                egui::RichText::new("Couldn't save")
-                                    .color(theme::DANGER)
-                                    .strong(),
-                            );
-                            ui.label(theme::small(message.clone()));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.add(theme::quiet("×")).on_hover_text("Dismiss").clicked()
-                                    {
-                                        dismiss = true;
-                                    }
-                                    if ui.add(theme::quiet("Details")).clicked() {
-                                        open_details = Some(job.id);
-                                    }
-                                },
-                            );
-                        }
-                        JobState::Canceled => {
-                            ui.label("Canceled");
-                            ui.label(theme::small("Nothing was saved."));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.add(theme::quiet("×")).clicked() {
-                                        dismiss = true;
-                                    }
-                                },
-                            );
-                        }
-                        JobState::Waiting => {}
-                    }
-                });
-            });
+        let small_btn =
+            |ui: &mut egui::Ui, text: &str| ui.add(theme::ghost(text).height(24.0)).clicked();
+        match &job.state {
+            JobState::Running {
+                fraction,
+                eta,
+                stage,
+            } => {
+                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                let mut text = format!("{stage} · {:.0}%", fraction * 100.0);
+                if let Some(e) = eta {
+                    text.push_str(&format!(" · {}", format::time_left(*e)));
+                }
+                ui.label(egui::RichText::new(text).size(12.0).color(theme::TEXT));
+                progress_bar(ui, *fraction as f32, 160.0);
+                ui.label(theme::small(
+                    job.outputs.first().map(name).unwrap_or_default(),
+                ));
+                if waiting > 0 {
+                    ui.label(theme::small(format!("· {waiting} more waiting")));
+                }
+                if small_btn(ui, "Cancel") {
+                    cancel = Some(job.id);
+                }
+            }
+            JobState::Done { outputs, .. } => {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                Icon::Check.paint(ui.painter(), r, theme::SUCCESS);
+                let bytes: u64 = outputs.iter().map(|o| o.bytes).sum();
+                ui.label(
+                    egui::RichText::new(format!("Saved · {}", format::size(bytes)))
+                        .size(12.0)
+                        .color(theme::TEXT),
+                );
+                let label = if outputs.len() == 1 {
+                    name(&outputs[0].path)
+                } else {
+                    format!("{} videos", outputs.len())
+                };
+                ui.label(theme::small(label));
+                if small_btn(ui, "Show in folder") {
+                    show = outputs.first().map(|o| o.path.clone());
+                }
+                if small_btn(ui, "Details") {
+                    open_details = Some(job.id);
+                }
+                if small_btn(ui, "Dismiss") {
+                    dismiss = true;
+                }
+            }
+            JobState::Failed { message } => {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), Sense::hover());
+                Icon::Close.paint(ui.painter(), r, theme::DANGER);
+                ui.label(
+                    egui::RichText::new("Couldn't save")
+                        .size(12.0)
+                        .color(theme::DANGER),
+                );
+                ui.add(egui::Label::new(theme::small(message.clone())).truncate());
+                if small_btn(ui, "Details") {
+                    open_details = Some(job.id);
+                }
+                if small_btn(ui, "Dismiss") {
+                    dismiss = true;
+                }
+            }
+            JobState::Canceled => {
+                ui.label(
+                    egui::RichText::new("Canceled")
+                        .size(12.0)
+                        .color(theme::TEXT),
+                );
+                ui.label(theme::small("Nothing was saved."));
+                if small_btn(ui, "Dismiss") {
+                    dismiss = true;
+                }
+            }
+            JobState::Waiting => {}
+        }
         if let Some(id) = cancel {
             if let Some(e) = &self.engine {
                 e.cancel(id);
@@ -1296,6 +1751,7 @@ impl CutlineApp {
         if let Some(p) = show {
             show_in_folder(&p);
         }
+        true
     }
 
     fn drop_overlay(&mut self, ctx: &egui::Context) {
@@ -1338,16 +1794,20 @@ impl CutlineApp {
                 egui::Order::Foreground,
                 egui::Id::unique("drop"),
             ));
-            painter.rect_filled(
-                screen,
-                0,
-                Color32::from_rgba_unmultiplied(232, 240, 252, 230),
-            );
-            painter.rect_stroke(
-                screen.shrink(12.0),
-                12,
-                Stroke::new(3.0, theme::ACCENT),
+            painter.rect_filled(screen, 0, Color32::from_black_alpha(200));
+            painter.rect(
+                screen.shrink(16.0),
+                16,
+                theme::ACCENT_SOFT,
+                Stroke::new(2.0, theme::ACCENT),
                 egui::StrokeKind::Inside,
+            );
+            let c = screen.center();
+            painter.circle_filled(c - egui::vec2(0.0, 44.0), 30.0, theme::ACCENT);
+            Icon::Plus.paint(
+                &painter,
+                egui::Rect::from_center_size(c - egui::vec2(0.0, 44.0), egui::vec2(26.0, 26.0)),
+                Color32::WHITE,
             );
             let text = if self.project.is_empty() {
                 "Drop to open"
@@ -1355,11 +1815,11 @@ impl CutlineApp {
                 "Drop to add to the end of the timeline"
             };
             painter.text(
-                screen.center(),
+                c + egui::vec2(0.0, 10.0),
                 egui::Align2::CENTER_CENTER,
                 text,
-                egui::FontId::proportional(22.0),
-                INK,
+                egui::FontId::new(20.0, theme::semibold_family()),
+                theme::TEXT,
             );
         }
     }
@@ -1372,15 +1832,30 @@ impl CutlineApp {
         }
         let text = t.text.clone();
         egui::Area::new(egui::Id::unique("toast"))
-            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, HEADER_H + 14.0))
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(INK)
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .fill(theme::RAISED)
+                    .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(140),
+                    })
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(text).color(Color32::WHITE));
+                        ui.set_max_width(520.0);
+                        ui.horizontal(|ui| {
+                            let (r, _) =
+                                ui.allocate_exact_size(egui::vec2(16.0, 16.0), Sense::hover());
+                            Icon::Info.paint(ui.painter(), r, theme::ACCENT_HOVER);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(text).color(theme::TEXT),
+                            ));
+                        });
                     });
             });
         ctx.request_repaint_after(Duration::from_millis(500));
@@ -1392,29 +1867,33 @@ impl CutlineApp {
         };
         let mut open = None;
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("path-prompt")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading("Open a video");
-            ui.label(theme::small("Type or paste the path of a video file."));
-            let r = ui.add(
-                egui::TextEdit::singleline(text)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("/home/you/Videos/clip.mp4"),
-            );
-            r.request_focus();
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(theme::primary("Open")).clicked()
-                        || ui.input(|i| i.key_pressed(Key::Enter))
-                    {
-                        open = Some(PathBuf::from(text.trim()));
-                    }
-                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
-                        close = true;
-                    }
+        egui::Modal::new(egui::Id::unique("path-prompt"))
+            .frame(theme::dialog_frame().inner_margin(20))
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Open a video");
+                ui.label(theme::small("Type or paste the path of a video file."));
+                let r = ui.add(
+                    egui::TextEdit::singleline(text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/home/you/Videos/clip.mp4"),
+                );
+                r.request_focus();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(theme::primary("Open")).clicked()
+                            || ui.input(|i| i.key_pressed(Key::Enter))
+                        {
+                            open = Some(PathBuf::from(text.trim()));
+                        }
+                        if ui.add(theme::secondary("Cancel")).clicked()
+                            || ui.input(|i| i.key_pressed(Key::Escape))
+                        {
+                            close = true;
+                        }
+                    });
                 });
             });
-        });
         if let Some(p) = open {
             self.path_prompt = None;
             let p = shellexpand_home(&p);
@@ -1439,28 +1918,30 @@ impl CutlineApp {
             }
         }
         if self.confirm_quit {
-            egui::Modal::new(egui::Id::unique("quit")).show(ctx, |ui| {
-                ui.set_width(380.0);
-                ui.heading("Still saving");
-                ui.label("If you quit now, the export stops and nothing is saved.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(theme::primary("Keep saving")).clicked() {
-                            self.confirm_quit = false;
-                        }
-                        if ui.button("Quit anyway").clicked() {
-                            if let Some(e) = &self.engine {
-                                e.cancel_all();
+            egui::Modal::new(egui::Id::unique("quit"))
+                .frame(theme::dialog_frame().inner_margin(20))
+                .show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading("Still saving");
+                    ui.label("If you quit now, the export stops and nothing is saved.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(theme::primary("Keep saving")).clicked() {
+                                self.confirm_quit = false;
                             }
-                            self.save_session_if_changed(true);
-                            // Give the worker a moment to kill ffmpeg and clean up.
-                            std::thread::sleep(Duration::from_millis(300));
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
+                            if ui.add(theme::secondary("Quit anyway")).clicked() {
+                                if let Some(e) = &self.engine {
+                                    e.cancel_all();
+                                }
+                                self.save_session_if_changed(true);
+                                // Give the worker a moment to kill ffmpeg and clean up.
+                                std::thread::sleep(Duration::from_millis(300));
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
                     });
                 });
-            });
         }
     }
 
@@ -1469,6 +1950,72 @@ impl CutlineApp {
             .clip(clip)
             .and_then(|c| self.sources.get(&c.path))
     }
+}
+
+/// `HH:MM:SS:FF` at the clip's frame rate.
+fn timecode(secs: f64, fps: f64) -> String {
+    let s = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+    let fps_i = fps.round().max(1.0) as u64;
+    let total_frames = (s * fps).round() as u64;
+    let f = total_frames % fps_i;
+    let whole = total_frames / fps_i;
+    format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        whole / 3600,
+        (whole / 60) % 60,
+        whole % 60,
+        f
+    )
+}
+
+fn trim_fps(fps: f64) -> String {
+    let r = (fps * 100.0).round() / 100.0;
+    if r.fract() == 0.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r}")
+    }
+}
+
+fn codec_name(codec: &str) -> String {
+    match codec {
+        "hevc" => "H.265".into(),
+        "h264" => "H.264".into(),
+        "av1" => "AV1".into(),
+        "vp9" => "VP9".into(),
+        "vp8" => "VP8".into(),
+        "mpeg4" => "MPEG-4".into(),
+        "prores" => "ProRes".into(),
+        other => other.to_uppercase(),
+    }
+}
+
+/// A key drawn as a little keycap, for the shortcut hints.
+fn keycap(ui: &mut egui::Ui, key: &str) {
+    let g = ui.painter().layout_no_wrap(
+        key.to_string(),
+        egui::FontId::proportional(10.5),
+        theme::MUTED,
+    );
+    let size = egui::vec2((g.size().x + 10.0).max(18.0), 18.0);
+    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect(
+        r,
+        4,
+        theme::RAISED,
+        Stroke::new(1.0, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .galley(r.center() - g.size() / 2.0, g, theme::MUTED);
+}
+
+fn progress_bar(ui: &mut egui::Ui, fraction: f32, width: f32) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), Sense::hover());
+    ui.painter().rect_filled(r, 3, theme::HOVER);
+    let mut f = r;
+    f.set_width(width * fraction.clamp(0.0, 1.0));
+    ui.painter().rect_filled(f, 3, theme::ACCENT);
 }
 
 fn shellexpand_home(p: &Path) -> PathBuf {
@@ -1535,91 +2082,54 @@ impl eframe::App for CutlineApp {
             return;
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(16))
-            .show(ui, |ui| {
+        egui::Panel::top("header")
+            .exact_size(HEADER_H)
+            .frame(
                 egui::Frame::new()
-                    .stroke(Stroke::new(1.0, theme::BORDER))
-                    .corner_radius(10)
-                    .show(ui, |ui| {
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin::symmetric(16, 4))
-                            .show(ui, |ui| self.top_bar(ui));
-                        let r = ui.max_rect();
-                        ui.painter().hline(
-                            r.x_range(),
-                            ui.cursor().top(),
-                            Stroke::new(1.0, theme::HAIRLINE),
-                        );
-                        egui::Frame::new().inner_margin(16).show(ui, |ui| {
-                            let job_h = if self
-                                .jobs
-                                .iter()
-                                .any(|j| !j.dismissed && !matches!(j.state, JobState::Waiting))
-                            {
-                                1.0
-                            } else {
-                                0.0
-                            };
-                            let h = (ui.available_height() - self.below_h - 16.0).max(160.0);
-                            self.preview_area(ui, h);
-                            let below_top = ui.cursor().top();
-                            self.transport(ui);
-                            let action = timeline::show(ui, self);
-                            match action {
-                                TimelineAction::None => {}
-                                TimelineAction::Seek(c, t) => self.seek(c, t),
-                                TimelineAction::DragStart(c, t) => {
-                                    if self.resume_after_drag.is_none() {
-                                        self.checkpoint();
-                                        let playing = self.playing();
-                                        if let Some(p) = &mut self.player {
-                                            p.set_paused(true);
-                                        }
-                                        self.resume_after_drag = Some(playing);
-                                    }
-                                    self.seek(c, t);
-                                }
-                                TimelineAction::Dragging(c, t) => self.seek(c, t),
-                                TimelineAction::DragEnd(c, t, start_handle) => {
-                                    self.seek(c, t);
-                                    // Keep playing from a new start; stay on the last frame after moving an end.
-                                    if let (Some(true), true) =
-                                        (self.resume_after_drag.take(), start_handle)
-                                    {
-                                        if let Some(p) = &mut self.player {
-                                            p.set_paused(false);
-                                        }
-                                    }
-                                    self.resume_after_drag = None;
-                                }
-                                TimelineAction::Checkpoint => self.checkpoint(),
-                                TimelineAction::RemoveClip(c) => {
-                                    self.checkpoint();
-                                    let was_loaded = self.loaded == Some(c);
-                                    self.project.remove_clip(c);
-                                    if was_loaded {
-                                        self.loaded = None;
-                                        self.after_project_swap_reload();
-                                    }
-                                }
-                                TimelineAction::MoveClip(c, d) => {
-                                    self.checkpoint();
-                                    self.project.move_clip(c, d);
-                                }
-                            }
-                            self.part_controls(ui);
-                            if job_h > 0.0 {
-                                ui.add_space(4.0);
-                                self.job_bar(ui);
-                            }
-                            let measured = ui.min_rect().bottom() - below_top;
-                            if (measured - self.below_h).abs() > 0.5 {
-                                self.below_h = measured;
-                                ui.ctx().request_repaint();
-                            }
-                        });
-                    });
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
+            )
+            .show(ui, |ui| self.header(ui));
+        egui::Panel::bottom("status")
+            .exact_size(STATUS_H)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
+            )
+            .show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("editor")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 14,
+                        top: 10,
+                        bottom: 12,
+                    }),
+            )
+            .show(ui, |ui| {
+                self.edit_toolbar(ui);
+                ui.add_space(4.0);
+                let action = timeline::show(ui, self);
+                self.timeline_action(action);
+            });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin {
+                        left: 14,
+                        right: 14,
+                        top: 14,
+                        bottom: 0,
+                    }),
+            )
+            .show(ui, |ui| {
+                let h = (ui.available_height() - TRANSPORT_H).max(120.0);
+                self.viewer(ui, h);
+                self.transport(ui);
             });
 
         // Windows and dialogs on top.
@@ -1673,6 +2183,49 @@ impl eframe::App for CutlineApp {
 }
 
 impl CutlineApp {
+    fn timeline_action(&mut self, action: TimelineAction) {
+        match action {
+            TimelineAction::None => {}
+            TimelineAction::Seek(c, t) => self.seek(c, t),
+            TimelineAction::DragStart(c, t) => {
+                if self.resume_after_drag.is_none() {
+                    self.checkpoint();
+                    let playing = self.playing();
+                    if let Some(p) = &mut self.player {
+                        p.set_paused(true);
+                    }
+                    self.resume_after_drag = Some(playing);
+                }
+                self.seek(c, t);
+            }
+            TimelineAction::Dragging(c, t) => self.seek(c, t),
+            TimelineAction::DragEnd(c, t, start_handle) => {
+                self.seek(c, t);
+                // Keep playing from a new start; stay on the last frame after moving an end.
+                if let (Some(true), true) = (self.resume_after_drag.take(), start_handle) {
+                    if let Some(p) = &mut self.player {
+                        p.set_paused(false);
+                    }
+                }
+                self.resume_after_drag = None;
+            }
+            TimelineAction::Checkpoint => self.checkpoint(),
+            TimelineAction::RemoveClip(c) => {
+                self.checkpoint();
+                let was_loaded = self.loaded == Some(c);
+                self.project.remove_clip(c);
+                if was_loaded {
+                    self.loaded = None;
+                    self.after_project_swap_reload();
+                }
+            }
+            TimelineAction::MoveClip(c, d) => {
+                self.checkpoint();
+                self.project.move_clip(c, d);
+            }
+        }
+    }
+
     fn after_project_swap_reload(&mut self) {
         if let Some(c) = self.project.clips.first().map(|c| c.id) {
             self.load_clip(c, Timestamp::ZERO, false);
@@ -1683,5 +2236,28 @@ impl CutlineApp {
             self.preview = None;
             self.playhead = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timecode_counts_frames() {
+        assert_eq!(timecode(0.0, 30.0), "00:00:00:00");
+        assert_eq!(timecode(4.1, 30.0), "00:00:04:03");
+        assert_eq!(timecode(3725.48, 25.0), "01:02:05:12");
+        // 29.97 fps counts 30 frame numbers per second.
+        assert_eq!(timecode(0.95, 29.97), "00:00:00:28");
+        assert_eq!(timecode(f64::NAN, 30.0), "00:00:00:00");
+    }
+
+    #[test]
+    fn codec_and_fps_labels() {
+        assert_eq!(codec_name("hevc"), "H.265");
+        assert_eq!(codec_name("mjpeg"), "MJPEG");
+        assert_eq!(trim_fps(30.0), "30");
+        assert_eq!(trim_fps(29.97002997), "29.97");
     }
 }

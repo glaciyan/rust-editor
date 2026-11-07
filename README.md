@@ -3,7 +3,7 @@
 A simple video cutter for Linux, made for H.265 video. Open a file, drag two
 handles, press **Export**. No settings needed.
 
-![Main window: one big preview, one timeline, one Export button](docs/main.png)
+![Main window: a dark editor with one big preview, transport and volume controls, the timeline with trim handles, and the Export button](docs/main.png)
 
 ## Using it
 
@@ -14,7 +14,9 @@ handles, press **Export**. No settings needed.
    plays. The preview follows the handle you're dragging, so you see the exact
    frame you're cutting on. *+ Add part* marks more parts; *Keep selected* /
    *Remove selected* decides whether the marked parts are what you keep or what
-   you cut out.
+   you cut out. The volume slider next to the transport (or `↑` / `↓`, `M` to
+   mute) sets how loud the preview plays; it's remembered between runs and
+   never changes the exported file.
 3. **Export** (`Ctrl+E`). The dialog opens with *Original quality* selected, so
    Save finishes in seconds for most files and the result is saved next to the
    source as `<name> (cut).<ext>`.
@@ -48,6 +50,8 @@ launch.
 | `←` / `→` | One frame back / forward |
 | `Shift+←` / `Shift+→` | One second back / forward |
 | `Home` / `End` | Start / end of the timeline |
+| `↑` / `↓` | Preview volume up / down |
+| `M` | Mute / unmute the preview |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+O` / `Ctrl+E` | Open / Export |
 
