@@ -1,6 +1,9 @@
 //! The timeline: every video end to end as thumbnails, cut-out stretches
 //! striped dark, parts outlined (the selected one blue, with a handle at each
 //! end), part labels underneath, and the playhead.
+//!
+//! It zooms: Ctrl+scroll or a pinch zooms around the pointer, scrolling pans,
+//! and a thin bar under the labels shows and drags the visible stretch.
 
 use crate::app::CutlineApp;
 use crate::icons::Icon;
@@ -16,12 +19,84 @@ const HANDLE_W: f32 = 10.0;
 const GRAB: f32 = 10.0;
 /// How far a part's outline reaches above and below the film strip.
 const OUTLINE_OVERHANG: f32 = 3.0;
+/// The scroll bar's row under the labels: a gap, then the bar.
+const BAR_GAP: f32 = 6.0;
+const BAR_H: f32 = 4.0;
+/// At the deepest zoom a frame is this wide.
+const MAX_PX_PER_FRAME: f64 = 30.0;
+/// Frames get their own ticks on the ruler from this width up.
+const FRAME_TICK_PX: f64 = 6.0;
 
 #[derive(Default)]
 pub struct TimelineView {
     drag: Option<Drag>,
     /// Where the last right-click landed: (clip, clip-local time).
     menu_at: Option<(u64, Timestamp)>,
+    /// Seconds of timeline in view; `None` shows it all.
+    span: Option<f64>,
+    /// Where the view starts, in seconds of the whole timeline.
+    start: f64,
+    /// Width of the strip last frame, for zooming from the keyboard.
+    width: f32,
+    /// The playhead last frame, to bring it into view when it moves.
+    last_playhead: Option<f64>,
+    /// Dragging the scroll bar: where on its thumb it was grabbed (seconds).
+    bar_grab: Option<f64>,
+}
+
+impl TimelineView {
+    /// The stretch in view, as (start, length) in seconds.
+    pub fn window(&self, total: f64) -> (f64, f64) {
+        let total = total.max(1e-6);
+        let span = self.span.unwrap_or(total).clamp(1e-6, total);
+        (self.start.clamp(0.0, total - span), span)
+    }
+
+    pub fn is_zoomed(&self) -> bool {
+        self.span.is_some()
+    }
+
+    /// The narrowest view: a frame `MAX_PX_PER_FRAME` wide.
+    pub fn min_span(&self, fps: f64) -> f64 {
+        let w = if self.width > 0.0 { self.width } else { 1000.0 };
+        w as f64 / MAX_PX_PER_FRAME / fps.max(1.0)
+    }
+
+    /// Zoom in (`factor` > 1) or out, keeping `anchor` (seconds) where it is
+    /// on screen.
+    pub fn zoom(&mut self, total: f64, factor: f64, anchor: f64, min_span: f64) {
+        let (start, span) = self.window(total);
+        let frac = ((anchor - start) / span).clamp(0.0, 1.0);
+        let new = (span / factor).clamp(min_span.min(total), total);
+        if new >= total * 0.999 {
+            self.fit();
+            return;
+        }
+        self.span = Some(new);
+        self.start = (anchor - frac * new).clamp(0.0, total - new);
+    }
+
+    pub fn fit(&mut self) {
+        self.span = None;
+        self.start = 0.0;
+    }
+
+    /// Scroll the view by `secs` (negative: earlier).
+    pub fn pan(&mut self, total: f64, secs: f64) {
+        let (start, span) = self.window(total);
+        self.start = (start + secs).clamp(0.0, (total - span).max(0.0));
+    }
+
+    /// Scroll so `t` is in view: `paging` (while playing) flips to the next
+    /// stretch, otherwise `t` lands in the middle.
+    pub fn reveal(&mut self, total: f64, t: f64, paging: bool) {
+        let (start, span) = self.window(total);
+        if !self.is_zoomed() || (t >= start && t <= start + span) {
+            return;
+        }
+        let lead = if paging { 0.1 } else { 0.5 };
+        self.start = (t - lead * span).clamp(0.0, total - span);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -49,14 +124,32 @@ struct Geometry {
     ruler: Rect,
     strip: Rect,
     total: f64,
+    /// The stretch in view, in seconds.
+    start: f64,
+    span: f64,
 }
 
 impl Geometry {
-    fn x(&self, t: f64) -> f32 {
-        self.strip.left() + (t / self.total.max(1e-6)) as f32 * self.strip.width()
+    fn new(ruler: Rect, strip: Rect, total: f64, view: &TimelineView) -> Self {
+        let (start, span) = view.window(total);
+        Geometry {
+            ruler,
+            strip,
+            total,
+            start,
+            span,
+        }
     }
+    fn x(&self, t: f64) -> f32 {
+        self.strip.left() + ((t - self.start) / self.span) as f32 * self.strip.width()
+    }
+    /// The time under `x`, kept to the stretch in view.
     fn t(&self, x: f32) -> f64 {
-        (((x - self.strip.left()) / self.strip.width()).clamp(0.0, 1.0) as f64) * self.total
+        let f = ((x - self.strip.left()) / self.strip.width()).clamp(0.0, 1.0) as f64;
+        (self.start + f * self.span).clamp(0.0, self.total)
+    }
+    fn end(&self) -> f64 {
+        self.start + self.span
     }
 }
 
@@ -84,12 +177,10 @@ pub fn show(ui: &mut egui::Ui, app: &mut CutlineApp) -> TimelineAction {
         egui::pos2(outer.left(), ruler.bottom()),
         egui::vec2(outer.width(), STRIP_H),
     );
-    let geo = Geometry {
-        ruler,
-        strip,
-        total: app.project.total_duration().secs(),
-    };
-    if app.project.is_empty() || geo.total <= 0.0 {
+    let total = app.project.total_duration().secs();
+    app.timeline.width = strip.width();
+    if app.project.is_empty() || total <= 0.0 {
+        app.timeline.fit();
         let p = ui.painter();
         p.rect(
             strip,
@@ -106,26 +197,158 @@ pub fn show(ui: &mut egui::Ui, app: &mut CutlineApp) -> TimelineAction {
             MUTED,
         );
         ui.allocate_exact_size(
-            egui::vec2(strip.width(), LABELS_GAP + LABELS_H),
+            egui::vec2(strip.width(), LABELS_GAP + LABELS_H + BAR_GAP + BAR_H),
             Sense::hover(),
         );
         return action;
     }
-    draw_ruler(ui, &geo);
-    draw(ui, app, &geo);
+    steer(ui, app, &resp, ruler, strip, total);
+    let geo = Geometry::new(ruler, strip, total, &app.timeline);
+    // Nothing of the timeline spills past its edges when zoomed in.
+    let clip = Rect::from_x_y_ranges(
+        outer.left() - 7.0..=outer.right() + 7.0,
+        ui.clip_rect().y_range(),
+    )
+    .intersect(ui.clip_rect());
+    let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(ui.max_rect()));
+    inner.set_clip_rect(clip);
+    draw_ruler(&inner, app, &geo);
+    draw(&mut inner, app, &geo);
     action = interact(ui, app, &geo, &resp);
-    hover_line(ui, app, &geo, &resp);
+    hover_line(&inner, app, &geo, &resp);
     labels(ui, app, &geo);
+    scroll_bar(ui, app, &geo);
     action
 }
 
+/// Zoom, pan, follow the playhead and scroll while dragging near an edge,
+/// before anything is drawn.
+fn steer(
+    ui: &egui::Ui,
+    app: &mut CutlineApp,
+    resp: &egui::Response,
+    ruler: Rect,
+    strip: Rect,
+    total: f64,
+) {
+    let fps = app.current_fps();
+    let min_span = app.timeline.min_span(fps);
+    let geo = Geometry::new(ruler, strip, total, &app.timeline);
+    if resp.contains_pointer() {
+        let (zoom, scroll) = ui.input(|i| (i.zoom_delta() as f64, i.smooth_scroll_delta));
+        if zoom != 1.0 {
+            let anchor = ui
+                .ctx()
+                .pointer_hover_pos()
+                .map(|p| geo.t(p.x))
+                .unwrap_or(geo.start + geo.span / 2.0);
+            app.timeline.zoom(total, zoom, anchor, min_span);
+        } else if app.timeline.is_zoomed() {
+            let px = (scroll.x + scroll.y) as f64;
+            if px != 0.0 {
+                app.timeline
+                    .pan(total, -px / strip.width() as f64 * geo.span);
+            }
+        }
+    }
+    // Keep the playhead in view when it moves on its own (playing, keys).
+    let now = app
+        .playhead
+        .map(|(c, t)| app.project.clip_offset(c).secs() + t.secs());
+    if app.timeline.drag.is_none() && now != app.timeline.last_playhead {
+        if let Some(t) = now {
+            app.timeline.reveal(total, t, app.playing());
+        }
+    }
+    app.timeline.last_playhead = now;
+    // Dragging past an edge scrolls, faster the further out.
+    if app.timeline.drag.is_some() && app.timeline.is_zoomed() {
+        if let Some(p) = ui.ctx().pointer_latest_pos() {
+            let edge = 32.0;
+            let out = if p.x < strip.left() + edge {
+                (p.x - strip.left() - edge) / edge
+            } else if p.x > strip.right() - edge {
+                (p.x - strip.right() + edge) / edge
+            } else {
+                0.0
+            };
+            if out != 0.0 {
+                let dt = ui.input(|i| i.stable_dt).min(0.1) as f64;
+                let (_, span) = app.timeline.window(total);
+                app.timeline
+                    .pan(total, out.clamp(-3.0, 3.0) as f64 * span * 0.8 * dt);
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+}
+
+/// The thin bar under the labels: where the view sits in the whole
+/// timeline. Drag it to scroll, click the track to jump there.
+fn scroll_bar(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
+    ui.add_space(BAR_GAP - 3.0);
+    let (row, resp) = ui.allocate_exact_size(
+        egui::vec2(geo.strip.width(), BAR_H + 6.0),
+        if app.timeline.is_zoomed() {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+    if !app.timeline.is_zoomed() {
+        app.timeline.bar_grab = None;
+        return;
+    }
+    resp.widget_info(|| egui::WidgetInfo::slider(true, geo.start, "Timeline scroll"));
+    let track = Rect::from_center_size(row.center(), egui::vec2(row.width(), BAR_H));
+    let thumb_of = |start: f64, span: f64| {
+        let a = track.left() + (start / geo.total) as f32 * track.width();
+        let w = ((span / geo.total) as f32 * track.width()).max(24.0);
+        Rect::from_x_y_ranges(a..=(a + w).min(track.right()), track.y_range())
+    };
+    let at = |x: f32| ((x - track.left()) / track.width()).clamp(0.0, 1.0) as f64 * geo.total;
+    if resp.drag_started() || resp.clicked() {
+        // Where the press began: a drag only registers once the pointer has
+        // moved, and grabbing there would make the view lag the pointer.
+        let origin = ui
+            .input(|i| i.pointer.press_origin())
+            .or(resp.interact_pointer_pos());
+        if let Some(p) = origin {
+            let thumb = thumb_of(geo.start, geo.span);
+            app.timeline.bar_grab = Some(if thumb.expand2(egui::vec2(0.0, 4.0)).contains(p) {
+                at(p.x) - geo.start
+            } else {
+                geo.span / 2.0
+            });
+        }
+    }
+    if let (Some(grab), Some(p)) = (app.timeline.bar_grab, resp.interact_pointer_pos()) {
+        if resp.dragged() || resp.drag_started() || resp.clicked() {
+            app.timeline.start = 0.0;
+            app.timeline.pan(geo.total, at(p.x) - grab);
+        }
+    }
+    if resp.drag_stopped() || resp.clicked() {
+        app.timeline.bar_grab = None;
+    }
+    let (start, span) = app.timeline.window(geo.total);
+    let p = ui.painter();
+    p.rect_filled(track, 2, theme::RAISED);
+    let active = resp.hovered() || resp.dragged();
+    p.rect_filled(
+        thumb_of(start, span),
+        2,
+        if active { MUTED } else { theme::BORDER_STRONG },
+    );
+}
+
 /// Pick a tick step so labels sit at least `min_px` apart.
-fn tick_step(total: f64, width: f32, min_px: f32) -> f64 {
-    const STEPS: [f64; 17] = [
-        0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0,
-        3600.0, 7200.0,
+fn tick_step(span: f64, width: f32, min_px: f32) -> f64 {
+    const STEPS: [f64; 18] = [
+        0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+        1800.0, 3600.0, 7200.0,
     ];
-    let px_per_s = width as f64 / total.max(1e-6);
+    let px_per_s = width as f64 / span.max(1e-6);
     STEPS
         .iter()
         .copied()
@@ -133,29 +356,55 @@ fn tick_step(total: f64, width: f32, min_px: f32) -> f64 {
         .unwrap_or(7200.0)
 }
 
-/// Time labels only, no tick marks: the first sits flush left, the last
-/// flush right, the rest centred on their time.
-fn draw_ruler(ui: &egui::Ui, geo: &Geometry) {
+/// `0:06`, or `0:06.2` / `0:06.25` when the labels are closer than a
+/// second (whole seconds stay `0:06`).
+fn ruler_label(t: f64, step: f64) -> String {
+    if step >= 1.0 || (t - t.round()).abs() < 1e-6 {
+        format::clock(t)
+    } else if step >= 0.1 {
+        format::clock_precise(t)
+    } else {
+        let hundredths = ((t.max(0.0) * 100.0).round() as u64) % 100;
+        format!("{}.{hundredths:02}", format::clock(t))
+    }
+}
+
+/// Time labels for the stretch in view, each centred on its time but kept
+/// inside the ruler. Zoomed in far enough, every frame gets a small tick.
+fn draw_ruler(ui: &egui::Ui, app: &CutlineApp, geo: &Geometry) {
     let p = ui.painter();
     let r = geo.ruler;
-    let step = tick_step(geo.total, r.width(), 120.0);
-    let n = (geo.total / step + 1e-9).floor() as usize;
+    // Frame ticks, per video (each has its own rate).
+    for c in &app.project.clips {
+        let fps = if c.fps > 0.0 { c.fps } else { continue };
+        let px_per_frame = r.width() as f64 / geo.span / fps;
+        if px_per_frame < FRAME_TICK_PX {
+            continue;
+        }
+        let off = app.project.clip_offset(c.id).secs();
+        let first = ((geo.start - off) * fps).ceil().max(0.0) as u64;
+        let last = ((geo.end() - off).min(c.duration.secs()) * fps)
+            .floor()
+            .max(0.0) as u64;
+        for k in first..=last {
+            let x = geo.x(off + k as f64 / fps);
+            // Above the strip's top edge, which its rounded corners cover.
+            p.vline(
+                x,
+                r.bottom() - 7.0..=r.bottom() - 3.0,
+                Stroke::new(1.0, theme::BORDER_STRONG),
+            );
+        }
+    }
+    let step = tick_step(geo.span, r.width(), 110.0);
+    let first = (geo.start / step - 1e-9).ceil().max(0.0) as u64;
+    let last = (geo.end() / step + 1e-9).floor() as u64;
     let mut last_right = f32::MIN;
-    for i in 0..=n {
+    for i in first..=last {
         let t = i as f64 * step;
-        let text = if step < 1.0 {
-            format::clock_precise(t)
-        } else {
-            format::clock(t)
-        };
-        let g = p.layout_no_wrap(text, theme::MONO(11.0), MUTED);
+        let g = p.layout_no_wrap(ruler_label(t, step), theme::MONO(11.0), MUTED);
         let w = g.size().x;
-        let x = geo.x(t);
-        let left = if i == 0 {
-            x
-        } else {
-            (x - w / 2.0).min(r.right() - w)
-        };
+        let left = (geo.x(t) - w / 2.0).clamp(r.left(), r.right() - w);
         if left < last_right + 8.0 {
             continue;
         }
@@ -164,8 +413,26 @@ fn draw_ruler(ui: &egui::Ui, geo: &Geometry) {
     }
 }
 
+/// Tile counts a strip can be cut into: about √2 apart, so a tile is never
+/// far from its natural width, yet zooming doesn't ask for a new set of
+/// thumbnails on every frame.
+fn tile_count(needed: f32) -> usize {
+    let mut c = 4.0f64;
+    while c < needed as f64 && c < 4096.0 {
+        c *= std::f64::consts::SQRT_2;
+    }
+    c.round() as usize
+}
+
 fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
-    let painter = ui.painter().clone();
+    let full = ui.painter().clone();
+    // The strip's contents stop at its edges; only the playhead's head may
+    // reach past them.
+    let painter = full.with_clip_rect(Rect::from_x_y_ranges(
+        geo.strip.x_range(),
+        full.clip_rect().y_range(),
+    ));
+    let settling = ui.input(|i| i.zoom_delta()) == 1.0;
     let ppp = ui.ctx().pixels_per_point();
     let strip = geo.strip;
     let multi = app.project.clips.len() > 1;
@@ -197,17 +464,22 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
             })
             .unwrap_or(16.0 / 9.0);
         let tile_w = STRIP_H * aspect;
-        let count = (((rect.width() / tile_w).ceil() as usize).div_ceil(4) * 4).clamp(4, 200);
-        app.want_thumbs(*id, count, (STRIP_H * ppp) as usize);
+        let count = tile_count(rect.width() / tile_w);
         let w = rect.width() / count as f32;
-        let clip_painter = painter.with_clip_rect(rect);
+        // Only the tiles in view.
+        let first = (((strip.left() - rect.left()) / w).floor().max(0.0) as usize).min(count);
+        let last = (((strip.right() - rect.left()) / w).ceil().max(0.0) as usize).min(count);
+        if settling {
+            app.want_thumbs(*id, count, (STRIP_H * ppp) as usize, first..last);
+        }
+        let clip_painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
         clip_painter.rect_filled(rect, 8, theme::RAISED);
-        for j in 0..count {
+        for j in first..last {
             let r = Rect::from_x_y_ranges(
                 rect.left() + j as f32 * w..=rect.left() + (j + 1) as f32 * w,
                 strip.y_range(),
             );
-            if let Some(tex) = app.thumb_tex.get(&(*id, count, j)) {
+            if let Some(tex) = app.thumb_for(*id, count, j) {
                 // Crop the picture to the tile's shape instead of squashing it.
                 let ta = tex.aspect_ratio();
                 let ra = r.width() / r.height();
@@ -239,8 +511,10 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
                 Color32::WHITE,
             );
             let w = galley.size().x.min(rect.width() - 16.0);
+            // Pinned to the visible start of its video when that's scrolled off.
+            let left = rect.left().max(strip.left()).min(rect.right() - w - 16.0);
             let bg = Rect::from_min_size(
-                rect.left_top() + egui::vec2(6.0, 6.0),
+                egui::pos2(left + 6.0, rect.top() + 6.0),
                 egui::vec2(w + 10.0, 17.0),
             );
             painter
@@ -261,12 +535,17 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
         let mut cur = 0.0;
         let shade = |a: f64, b: f64| {
             if b - a > 1e-6 {
-                let r = Rect::from_x_y_ranges(geo.x(off + a)..=geo.x(off + b), strip.y_range());
+                let r = Rect::from_x_y_ranges(geo.x(off + a)..=geo.x(off + b), strip.y_range())
+                    .intersect(painter.clip_rect());
+                if r.width() <= 0.0 {
+                    return;
+                }
                 painter.rect_filled(r, 0, Color32::from_black_alpha(168));
-                let hp = painter.with_clip_rect(r.intersect(painter.clip_rect()));
-                // 45° bands, 6 px wide and 12 px apart.
+                let hp = painter.with_clip_rect(r);
+                // 45° bands, 6 px wide and 12 px apart, moving with the video.
                 let period = 17.0;
-                let mut x = (r.left() / period).floor() * period - r.height();
+                let phase = geo.x(0.0).rem_euclid(period);
+                let mut x = ((r.left() - phase) / period).floor() * period + phase - r.height();
                 while x < r.right() + r.height() {
                     hp.line_segment(
                         [
@@ -342,13 +621,13 @@ fn draw(ui: &mut egui::Ui, app: &mut CutlineApp, geo: &Geometry) {
     if let Some((clip, t)) = app.playhead {
         let x = geo.x(app.project.clip_offset(clip).secs() + t.secs());
         let top = geo.ruler.top() + 14.0;
-        painter.vline(
+        full.vline(
             x,
             top..=strip.bottom() + 6.0,
             Stroke::new(2.0, theme::PLAYHEAD),
         );
         let head = Rect::from_min_size(egui::pos2(x - 6.0, top - 2.0), egui::vec2(12.0, 10.0));
-        painter.rect_filled(
+        full.rect_filled(
             head,
             egui::CornerRadius {
                 nw: 3,
@@ -619,7 +898,11 @@ fn labels(ui: &mut egui::Ui, app: &CutlineApp, geo: &Geometry) {
                     clip: c.id,
                     part: p.id,
                 });
-            let mid = geo.x(off + (p.start.secs() + p.end.secs()) / 2.0);
+            let (xa, xb) = (geo.x(off + p.start.secs()), geo.x(off + p.end.secs()));
+            if xb < row.left() || xa > row.right() {
+                continue;
+            }
+            let mid = (xa.max(row.left()) + xb.min(row.right())) / 2.0;
             let text = match app.project.mode {
                 PartMode::Keep => format!("Part {n} · {}", format::length(p.len().secs())),
                 PartMode::Remove => format!("Cut {n} · {}", format::length(p.len().secs())),
@@ -640,6 +923,31 @@ fn labels(ui: &mut egui::Ui, app: &CutlineApp, geo: &Geometry) {
             }
             painter.galley(egui::pos2(left, row.top()), galley, color);
             last_right = left + w;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ruler_labels() {
+        assert_eq!(ruler_label(6.0, 2.0), "0:06");
+        assert_eq!(ruler_label(4.0, 0.5), "0:04");
+        assert_eq!(ruler_label(4.5, 0.5), "0:04.5");
+        assert_eq!(ruler_label(4.55, 0.05), "0:04.55");
+        assert_eq!(ruler_label(65.0, 0.05), "1:05");
+    }
+
+    #[test]
+    fn tile_counts_stay_near_their_natural_width() {
+        for needed in [1.0, 4.5, 9.2, 100.0, 1000.0] {
+            let c = tile_count(needed) as f32;
+            assert!(
+                c >= needed && c <= (needed * 1.5).max(4.0),
+                "{needed} -> {c}"
+            );
         }
     }
 }

@@ -33,6 +33,8 @@ pub enum Icon {
     ArrowLeft,
     ArrowRight,
     Pencil,
+    ZoomIn,
+    ZoomOut,
 }
 
 impl Icon {
@@ -231,6 +233,14 @@ impl Icon {
                     at(fx(3.0), 8.0),
                     at(fx(7.0), 12.0),
                 ]));
+            }
+            Icon::ZoomIn | Icon::ZoomOut => {
+                p.circle_stroke(at(7.0, 7.0), 4.8 * s, line);
+                p.add(path(vec![at(10.6, 10.6), at(14.0, 14.0)]));
+                p.add(path(vec![at(4.8, 7.0), at(9.2, 7.0)]));
+                if self == Icon::ZoomIn {
+                    p.add(path(vec![at(7.0, 4.8), at(7.0, 9.2)]));
+                }
             }
             Icon::Pencil => {
                 p.add(path(vec![

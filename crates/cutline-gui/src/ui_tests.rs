@@ -492,6 +492,7 @@ fn editor_keys_do_nothing_while_a_dialog_is_open() {
     }
     assert_eq!(parts(&h), before);
     assert!(!h.state().muted);
+    assert!(!h.state().timeline.is_zoomed());
     assert_eq!(dialogs(&h), [Kind::Export]);
     // Back in the editor, they work again.
     press(&mut h, Key::Escape);
@@ -802,4 +803,258 @@ fn esc_closes_the_timeline_menu_only() {
     press(&mut h, Key::Escape);
     assert!(!has_control(&h, "Split here"));
     assert_eq!(parts(&h).len(), 1);
+}
+
+// ---------- zooming the timeline ----------
+
+fn total(h: &Harness<'_, CutlineApp>) -> f64 {
+    h.state().project.total_duration().secs()
+}
+
+/// The stretch of timeline in view, (start, length) in seconds.
+fn window(h: &Harness<'_, CutlineApp>) -> (f64, f64) {
+    h.state().timeline.window(total(h))
+}
+
+/// Where time `t` is on screen.
+fn x_of(h: &Harness<'_, CutlineApp>, t: f64) -> f32 {
+    let r = control(h, "Timeline").rect();
+    let (start, span) = window(h);
+    r.left() + ((t - start) / span) as f32 * r.width()
+}
+
+fn time_at(h: &Harness<'_, CutlineApp>, x: f32) -> f64 {
+    let r = control(h, "Timeline").rect();
+    let (start, span) = window(h);
+    start + ((x - r.left()) / r.width()) as f64 * span
+}
+
+fn strip_point(h: &Harness<'_, CutlineApp>, t: f64) -> egui::Pos2 {
+    egui::pos2(x_of(h, t), control(h, "Timeline").rect().bottom() - 20.0)
+}
+
+fn wheel(h: &mut Harness<'_, CutlineApp>, at: egui::Pos2, delta: egui::Vec2, modifiers: Modifiers) {
+    h.hover_at(at);
+    h.run();
+    h.event_modifiers(
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers,
+            source: egui::MouseWheelSource::Wheel,
+        },
+        modifiers,
+    );
+    // Wheel scrolling is eased over a few frames.
+    h.run_steps(40);
+}
+
+fn left_click_at(h: &mut Harness<'_, CutlineApp>, pos: egui::Pos2) {
+    h.hover_at(pos);
+    h.run();
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        });
+    }
+    h.run();
+}
+
+#[test]
+fn ctrl_scroll_zooms_in_around_the_pointer() {
+    let mut h = editor();
+    let at = strip_point(&h, 6.0);
+    wheel(&mut h, at, egui::vec2(0.0, 120.0), Modifiers::COMMAND);
+    let (_, span) = window(&h);
+    assert!(h.state().timeline.is_zoomed());
+    assert!(span < total(&h) * 0.9, "{span}");
+    // The moment under the pointer stays under the pointer.
+    assert!(
+        (time_at(&h, at.x) - 6.0).abs() < 0.05,
+        "{}",
+        time_at(&h, at.x)
+    );
+    // And back out again.
+    wheel(&mut h, at, egui::vec2(0.0, -2000.0), Modifiers::COMMAND);
+    assert!(!h.state().timeline.is_zoomed());
+}
+
+#[test]
+fn a_pinch_zooms_too() {
+    let mut h = editor();
+    h.hover_at(strip_point(&h, 12.0));
+    h.run();
+    h.event(egui::Event::Zoom(4.0));
+    h.run();
+    let (start, span) = window(&h);
+    assert!((span - total(&h) / 4.0).abs() < 0.01, "{span}");
+    assert!(start <= 12.0 && 12.0 <= start + span);
+}
+
+#[test]
+fn scrolling_pans_only_when_zoomed() {
+    let mut h = editor();
+    let at = strip_point(&h, 2.0);
+    wheel(&mut h, at, egui::vec2(0.0, -200.0), Modifiers::NONE);
+    assert_eq!(window(&h), (0.0, total(&h)));
+
+    press(&mut h, Key::Equals);
+    let (start, span) = window(&h);
+    assert_eq!(start, 0.0);
+    wheel(&mut h, at, egui::vec2(0.0, -200.0), Modifiers::NONE);
+    let (later, span2) = window(&h);
+    assert!(later > 0.0, "scrolling down moves to later times");
+    assert_eq!(span, span2, "scrolling doesn't zoom");
+    // It stops at the ends.
+    wheel(&mut h, at, egui::vec2(0.0, -1e6), Modifiers::NONE);
+    let (end, _) = window(&h);
+    assert!((end + span - total(&h)).abs() < 1e-6);
+    wheel(&mut h, at, egui::vec2(0.0, 1e6), Modifiers::NONE);
+    assert_eq!(window(&h).0, 0.0);
+}
+
+#[test]
+fn zoom_buttons_keys_and_fit() {
+    let mut h = editor();
+    let clip = h.state().project.clips[0].id;
+    h.state_mut().playhead = Some((clip, Timestamp::from_secs(8.0)));
+    h.run();
+    assert!(is_disabled(&control(&h, "Zoom out")));
+    assert!(is_disabled(&control(&h, "Fit timeline")));
+    // Zooming from the keyboard keeps the playhead in place on screen.
+    let before = x_of(&h, 8.0);
+    press(&mut h, Key::Equals);
+    let (_, span) = window(&h);
+    assert!((span - total(&h) / 2.0).abs() < 1e-6);
+    assert!((x_of(&h, 8.0) - before).abs() < 1.0);
+    click(&mut h, "Zoom in");
+    assert!((window(&h).1 - total(&h) / 4.0).abs() < 1e-6);
+    click(&mut h, "Zoom out");
+    press(&mut h, Key::Minus);
+    assert!(!h.state().timeline.is_zoomed());
+    // As deep as one frame per 30 px, and no deeper.
+    for _ in 0..20 {
+        press(&mut h, Key::Equals);
+    }
+    assert!(is_disabled(&control(&h, "Zoom in")));
+    let r = control(&h, "Timeline").rect();
+    let px_per_frame = r.width() as f64 / window(&h).1 / 120.0;
+    assert!((px_per_frame - 30.0).abs() < 0.5, "{px_per_frame}");
+    click(&mut h, "Fit timeline");
+    assert_eq!(window(&h), (0.0, total(&h)));
+}
+
+#[test]
+fn clicking_a_zoomed_timeline_seeks_to_the_time_under_the_pointer() {
+    let mut h = editor();
+    let t = total(&h);
+    let min = h.state().timeline.min_span(120.0);
+    h.state_mut().timeline.zoom(t, 8.0, 10.0, min);
+    h.run();
+    let (start, span) = window(&h);
+    let target = start + span * 0.3;
+    let at = strip_point(&h, target);
+    left_click_at(&mut h, at);
+    let (_, at) = h.state().playhead.unwrap();
+    assert!(
+        (at.secs() - target).abs() < 1.0 / 120.0 + 1e-3,
+        "{} vs {target}",
+        at.secs()
+    );
+}
+
+#[test]
+fn the_view_follows_the_playhead() {
+    let mut h = editor();
+    press(&mut h, Key::Equals);
+    press(&mut h, Key::Equals);
+    assert_eq!(window(&h).0, 0.0);
+    press(&mut h, Key::End);
+    let (start, span) = window(&h);
+    assert!(start + span >= total(&h) - 1e-6, "the end is in view");
+    press(&mut h, Key::Home);
+    assert_eq!(window(&h).0, 0.0);
+}
+
+#[test]
+fn the_scroll_bar_drags_the_view() {
+    let mut h = editor();
+    assert!(
+        !has_control(&h, "Timeline scroll"),
+        "no bar when everything fits"
+    );
+    press(&mut h, Key::Equals);
+    press(&mut h, Key::Equals);
+    let bar = control(&h, "Timeline scroll").rect();
+    let (_, span) = window(&h);
+    // Grab the thumb (the first quarter) and drag it half the track right.
+    let from = egui::pos2(bar.left() + bar.width() * 0.125, bar.center().y);
+    let to = from + egui::vec2(bar.width() * 0.5, 0.0);
+    h.hover_at(from);
+    h.run();
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    h.run();
+    for i in 1..=10 {
+        h.hover_at(from + (to - from) * (i as f32 / 10.0));
+        h.run();
+    }
+    h.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run();
+    let (start, span2) = window(&h);
+    assert_eq!(span, span2);
+    assert!((start - total(&h) * 0.5).abs() < 0.1, "{start}");
+}
+
+#[test]
+fn dragging_a_handle_to_the_edge_scrolls_the_view() {
+    let mut h = editor();
+    press(&mut h, Key::Equals);
+    press(&mut h, Key::Equals);
+    let (_, span) = window(&h);
+    // The part's start handle sits just inside its left end.
+    let grab = strip_point(&h, 0.0) + egui::vec2(5.0, 0.0);
+    let edge = egui::pos2(control(&h, "Timeline").rect().right() - 4.0, grab.y);
+    h.hover_at(grab);
+    h.run();
+    h.event(egui::Event::PointerButton {
+        pos: grab,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: Modifiers::NONE,
+    });
+    h.step();
+    for i in 1..=5 {
+        h.hover_at(grab + (edge - grab) * (i as f32 / 5.0));
+        h.step();
+    }
+    // Hold it there for a moment.
+    h.run_steps(30);
+    let (start, _) = window(&h);
+    assert!(start > 0.5, "the view should scroll on, at {start}");
+    h.event(egui::Event::PointerButton {
+        pos: edge,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: Modifiers::NONE,
+    });
+    h.run();
+    let part_start = parts(&h)[0].0;
+    assert!(
+        part_start > span,
+        "the handle went past the first view: {part_start}"
+    );
 }

@@ -54,11 +54,18 @@ launch.
 | `←` / `→` | One frame back / forward |
 | `Shift+←` / `Shift+→` | One second back / forward |
 | `Home` / `End` | Start / end of the timeline |
+| `=` / `-` | Zoom the timeline in / out around the playhead |
 | `↑` / `↓` | Preview volume up / down |
 | `M` | Mute / unmute the preview |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+O` / `Ctrl+E` | Open / Export |
 | `Esc` / `Enter` | Close / confirm the dialog on top (New profile goes back to Export) |
+
+Zoom into the timeline with `Ctrl`+scroll (or pinch) where you point, `=` /
+`-`, or the zoom buttons by the totals, down to single frames; *Fit* shows it
+all again. Zoomed in, scroll to move along it or drag the bar under the part
+labels; the view follows the playhead, and dragging a handle against an edge
+scrolls on.
 
 Double-click an empty stretch of the timeline to add a part there. Right-click
 it to remove a part, reorder videos or take one off the timeline.

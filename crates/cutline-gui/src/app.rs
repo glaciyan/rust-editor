@@ -93,7 +93,9 @@ pub struct CutlineApp {
     resume_after_drag: Option<bool>,
     thumbs: Option<Thumbnailer>,
     pub thumb_tex: HashMap<(u64, usize, usize), egui::TextureHandle>,
-    thumb_requested: HashSet<(u64, usize)>,
+    thumb_requested: HashSet<(u64, usize, usize)>,
+    /// Tile counts asked for per video, finest last.
+    thumb_counts: HashMap<u64, Vec<usize>>,
     pub timeline: TimelineView,
     /// Open dialogs, bottom first; only the last one is shown.
     pub dialogs: Vec<Dialog>,
@@ -124,6 +126,10 @@ pub struct CutlineApp {
 }
 
 const HEADER_H: f32 = 48.0;
+/// Room the zoom buttons take in the timeline toolbar.
+const ZOOM_W: f32 = 120.0;
+/// A thumbnail's request index is `count * THUMB_SLOTS + tile`.
+const THUMB_SLOTS: usize = 100_000;
 const TRANSPORT_H: f32 = 48.0;
 
 pub fn percent_decode(s: &str) -> String {
@@ -249,6 +255,7 @@ impl CutlineApp {
             thumbs,
             thumb_tex: HashMap::new(),
             thumb_requested: HashSet::new(),
+            thumb_counts: HashMap::new(),
             timeline: TimelineView::default(),
             dialogs: vec![],
             jobs: vec![],
@@ -790,15 +797,18 @@ impl CutlineApp {
                 egui::TextureOptions::LINEAR,
             );
             self.thumb_tex
-                .insert((r.clip, r.index / 1000, r.index % 1000), tex);
+                .insert((r.clip, r.index / THUMB_SLOTS, r.index % THUMB_SLOTS), tex);
         }
     }
 
-    /// Ask for `count` thumbnails across a clip (cached per count).
-    pub fn want_thumbs(&mut self, clip: u64, count: usize, tile_h: usize) {
-        if self.thumb_requested.contains(&(clip, count)) {
-            return;
-        }
+    /// Ask for tiles `range` of a clip cut into `count` thumbnails.
+    pub fn want_thumbs(
+        &mut self,
+        clip: u64,
+        count: usize,
+        tile_h: usize,
+        range: std::ops::Range<usize>,
+    ) {
         let Some(c) = self.project.clip(clip) else {
             return;
         };
@@ -810,21 +820,42 @@ impl CutlineApp {
         let (dw, dh) = v.display_size();
         let h = tile_h.max(16);
         let w = ((h as f64 * dw as f64 / dh.max(1) as f64).round() as usize).clamp(16, 400) / 2 * 2;
-        self.thumb_requested.insert((clip, count));
         let dur = c.duration.secs();
+        let counts = self.thumb_counts.entry(clip).or_default();
+        if !counts.contains(&count) {
+            counts.push(count);
+            counts.sort_unstable();
+        }
         // Middle tiles first feels faster than left-to-right.
-        let mut order: Vec<usize> = (0..count).collect();
-        order.sort_by_key(|i| (*i as i64 * 2 - count as i64).abs());
+        let mid = (range.start + range.end) as i64;
+        let mut order: Vec<usize> = range
+            .filter(|i| !self.thumb_requested.contains(&(clip, count, *i)))
+            .collect();
+        order.sort_by_key(|i| (*i as i64 * 2 - mid).abs());
         for i in order {
+            self.thumb_requested.insert((clip, count, i));
             t.request(ThumbRequest {
                 clip,
                 path: c.path.clone(),
-                index: count * 1000 + i,
+                index: count * THUMB_SLOTS + i,
                 time: (i as f64 + 0.5) * dur / count as f64,
                 width: w,
                 height: h,
             });
         }
+    }
+
+    /// Tile `j` of `count`, or while it loads, the loaded tile of another
+    /// count that shows the same moment (finest first).
+    pub fn thumb_for(&self, clip: u64, count: usize, j: usize) -> Option<&egui::TextureHandle> {
+        if let Some(t) = self.thumb_tex.get(&(clip, count, j)) {
+            return Some(t);
+        }
+        let at = (j as f64 + 0.5) / count as f64;
+        self.thumb_counts.get(&clip)?.iter().rev().find_map(|&c| {
+            let k = ((at * c as f64) as usize).min(c - 1);
+            self.thumb_tex.get(&(clip, c, k))
+        })
     }
 
     // ---------- keyboard ----------
@@ -865,6 +896,9 @@ impl CutlineApp {
                 (Key::M, "mute"),
                 (Key::ArrowUp, "vol-up"),
                 (Key::ArrowDown, "vol-down"),
+                (Key::Equals, "zoom-in"),
+                (Key::Plus, "zoom-in"),
+                (Key::Minus, "zoom-out"),
             ];
             if i.consume_key(Modifiers::SHIFT, Key::ArrowLeft) {
                 actions.push("back-1s");
@@ -937,6 +971,8 @@ impl CutlineApp {
             "mute" => self.toggle_mute(),
             "vol-up" => self.set_volume(self.shown_volume() + 5.0),
             "vol-down" => self.set_volume(self.shown_volume() - 5.0),
+            "zoom-in" => self.zoom_timeline(2.0),
+            "zoom-out" => self.zoom_timeline(0.5),
             _ => {}
         }
     }
@@ -961,6 +997,23 @@ impl CutlineApp {
             self.undo.pop();
             self.toast("There's no room for another part in this video.".into());
         }
+    }
+
+    /// Zoom the timeline around the playhead (around the middle of the view
+    /// when the playhead is out of it).
+    pub fn zoom_timeline(&mut self, factor: f64) {
+        let total = self.project.total_duration().secs();
+        if total <= 0.0 {
+            return;
+        }
+        let (start, span) = self.timeline.window(total);
+        let anchor = self
+            .playhead
+            .map(|(c, t)| self.project.clip_offset(c).secs() + t.secs())
+            .filter(|t| *t >= start && *t <= start + span)
+            .unwrap_or(start + span / 2.0);
+        let min = self.timeline.min_span(self.current_fps());
+        self.timeline.zoom(total, factor, anchor, min);
     }
 
     pub fn split_at_playhead(&mut self) {
@@ -1329,7 +1382,7 @@ impl CutlineApp {
         );
     }
 
-    fn current_fps(&self) -> f64 {
+    pub fn current_fps(&self) -> f64 {
         self.playhead
             .and_then(|(c, _)| self.project.clip(c))
             .or_else(|| self.project.clips.first())
@@ -1647,7 +1700,7 @@ impl CutlineApp {
                             .x
                 })
                 .unwrap_or(0.0);
-            if ui.available_width() - summary_w > 220.0 {
+            if ui.available_width() - summary_w - ZOOM_W > 220.0 {
                 ui.add_space(6.0);
                 ui.spacing_mut().item_spacing.x = 4.0;
                 ui.label(theme::small("Set start and end with"));
@@ -1656,6 +1709,8 @@ impl CutlineApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
+                self.zoom_controls(ui, has_media);
+                theme::vsep(ui, 20.0);
                 if let Some((count, rest, ok)) = summary {
                     if !ok {
                         ui.label(egui::RichText::new(count).color(theme::DANGER));
@@ -1669,6 +1724,46 @@ impl CutlineApp {
                 }
             });
         });
+    }
+
+    /// Zoom out, zoom in and Fit, right to left.
+    fn zoom_controls(&mut self, ui: &mut egui::Ui, has_media: bool) {
+        let total = self.project.total_duration().secs();
+        let zoomed = self.timeline.is_zoomed();
+        let (_, span) = self.timeline.window(total);
+        let deepest = span <= self.timeline.min_span(self.current_fps()) * 1.001;
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let s = egui::vec2(28.0, 28.0);
+        ui.add_enabled_ui(has_media && zoomed, |ui| {
+            if ui
+                .add(theme::ghost("Fit").label("Fit timeline").height(28.0))
+                .on_hover_text("Show the whole timeline")
+                .clicked()
+            {
+                self.timeline.fit();
+            }
+        });
+        ui.add_enabled_ui(has_media && !deepest, |ui| {
+            if theme::icon_button(ui, Icon::ZoomIn, s, "Zoom in", "Zoom in (=) · Ctrl+scroll")
+                .clicked()
+            {
+                self.zoom_timeline(2.0);
+            }
+        });
+        ui.add_enabled_ui(has_media && zoomed, |ui| {
+            if theme::icon_button(
+                ui,
+                Icon::ZoomOut,
+                s,
+                "Zoom out",
+                "Zoom out (−) · Ctrl+scroll",
+            )
+            .clicked()
+            {
+                self.zoom_timeline(0.5);
+            }
+        });
+        ui.spacing_mut().item_spacing.x = 6.0;
     }
 
     /// (`3 parts`, `· exports 11.4 s of 16.1 s`, anything exported).
@@ -2152,7 +2247,8 @@ impl CutlineApp {
                         left: 20,
                         right: 20,
                         top: 12,
-                        bottom: 14,
+                        // The scroll bar's row under the labels fills the rest.
+                        bottom: 2,
                     }),
             )
             .show(ui, |ui| {
