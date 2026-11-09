@@ -1008,6 +1008,11 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        // 4:2:0 needs even dimensions; an odd source (e.g. 1280x719) that the
+        // caps leave alone would otherwise reach the encoder as-is. Round down
+        // so the scale+pad below never upscales.
+        out_w = (out_w & !1).max(2);
+        out_h = (out_h & !1).max(2);
         let same_size_everywhere = infos
             .iter()
             .all(|m| m.video.as_ref().map(|v| v.display_size()) == Some((sw, sh)));
@@ -1717,6 +1722,33 @@ mod tests {
         let cmds = all_args(&plan.outputs[0]);
         assert!(cmds[0].contains("concat=n=2:v=1:a=1"), "{}", cmds[0]);
         assert!(cmds[0].contains("scale=1920:1080"));
+    }
+
+    #[test]
+    fn odd_source_size_is_made_even() {
+        // A 1280x719 source is under the 1080p cap, so nothing else would
+        // touch its size; libx264 rejects odd heights in yuv420p.
+        let share = Profile::presets()
+            .into_iter()
+            .find(|p| p.id == "share")
+            .unwrap();
+        let r = req(share, vec![("/v/a.mp4", 0.0, 5.0)]);
+        let facts = Facts {
+            sources: [("/v/a.mp4".into(), info("/v/a.mp4", "h264", 1281, 719))].into(),
+            packets: vec![],
+        };
+        let tmp = PathBuf::from("/tmp/x");
+        let plan = Planner {
+            req: &r,
+            facts: &facts,
+            caps: &caps(),
+            tmp: &tmp,
+            pass_log_dir: &tmp,
+        }
+        .plan()
+        .unwrap();
+        let cmds = all_args(&plan.outputs[0]);
+        assert!(cmds[0].contains("scale=1280:718"), "{}", cmds[0]);
     }
 
     #[test]
